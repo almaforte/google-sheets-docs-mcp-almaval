@@ -1,0 +1,5 @@
+fastmcp>=2.11.0
+uvicorn>=0.30.0
+starlette>=0.37.0
+google-api-python-client>=2.150.0
+google-auth>=2.35.0
