@@ -2,26 +2,34 @@
 Serveur MCP Google Sheets — Almaval / Claude
 =============================================
 
-Authentification : compte de service avec délégation au niveau du domaine.
+Authentification Google : compte de service avec délégation au niveau du domaine.
 Le serveur agit sous l'identité de l'utilisateur défini par IMPERSONATE_USER,
 avec exactement ses droits, ni plus ni moins.
+
+Authentification du connecteur : clé API portée par un en-tête de requête.
 
 Variables d'environnement attendues :
     GOOGLE_SERVICE_ACCOUNT_JSON   contenu intégral du fichier JSON de la clé
     IMPERSONATE_USER              ex. am.forte@almaval.ch
-    MCP_PATH                      chemin d'écoute, ex. /mcp-sheets-8f3a91  (défaut /mcp)
+    MCP_API_KEY                   clé attendue dans l'en-tête des requêtes
+    MCP_PATH                      chemin d'écoute, ex. /mcp-sheets-a7f3d91c4e2b
     PORT                          fourni automatiquement par Railway
 """
 
 import functools
+import hmac
 import json
 import os
 from typing import Any, Optional
 
+import uvicorn
 from fastmcp import FastMCP
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -493,160 +501,3 @@ def format_range(
             {
                 "updateDimensionProperties": {
                     "range": dim_range,
-                    "properties": {"pixelSize": row_height},
-                    "fields": "pixelSize",
-                }
-            }
-        )
-
-    if not requests:
-        return {"erreur": "Aucune propriété de mise en forme fournie."}
-
-    _sheets().spreadsheets().batchUpdate(
-        spreadsheetId=spreadsheet_id, body={"requests": requests}
-    ).execute()
-    return {"mise_en_forme_appliquee": len(requests)}
-
-
-@mcp.tool
-@tolerant
-def apply_house_style(
-    spreadsheet_id: str,
-    sheet_id: int,
-    header_row: bool = True,
-    row_height: int = 30,
-    freeze_header: bool = True,
-) -> Any:
-    """Applique la convention de présentation d'Alberto à tout un onglet.
-
-    Cellules centrées horizontalement et verticalement, texte renvoyé à la
-    ligne, lignes hautes de 30 pixels, première ligne en gras et figée.
-    """
-    info = (
-        _sheets()
-        .spreadsheets()
-        .get(
-            spreadsheetId=spreadsheet_id,
-            fields="sheets.properties(sheetId,gridProperties)",
-        )
-        .execute()
-    )
-    row_count = 1000
-    for sheet in info.get("sheets", []):
-        if sheet["properties"]["sheetId"] == sheet_id:
-            row_count = sheet["properties"].get("gridProperties", {}).get("rowCount", 1000)
-
-    requests: list = [
-        {
-            "repeatCell": {
-                "range": {"sheetId": sheet_id},
-                "cell": {
-                    "userEnteredFormat": {
-                        "horizontalAlignment": "CENTER",
-                        "verticalAlignment": "MIDDLE",
-                        "wrapStrategy": "WRAP",
-                    }
-                },
-                "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment,wrapStrategy)",
-            }
-        },
-        {
-            "updateDimensionProperties": {
-                "range": {
-                    "sheetId": sheet_id,
-                    "dimension": "ROWS",
-                    "startIndex": 0,
-                    "endIndex": row_count,
-                },
-                "properties": {"pixelSize": row_height},
-                "fields": "pixelSize",
-            }
-        },
-    ]
-
-    if header_row:
-        requests.append(
-            {
-                "repeatCell": {
-                    "range": {
-                        "sheetId": sheet_id,
-                        "startRowIndex": 0,
-                        "endRowIndex": 1,
-                    },
-                    "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
-                    "fields": "userEnteredFormat.textFormat.bold",
-                }
-            }
-        )
-
-    if freeze_header:
-        requests.append(
-            {
-                "updateSheetProperties": {
-                    "properties": {
-                        "sheetId": sheet_id,
-                        "gridProperties": {"frozenRowCount": 1},
-                    },
-                    "fields": "gridProperties.frozenRowCount",
-                }
-            }
-        )
-
-    _sheets().spreadsheets().batchUpdate(
-        spreadsheetId=spreadsheet_id, body={"requests": requests}
-    ).execute()
-    return {"style_applique": True, "lignes_traitees": row_count}
-
-
-@mcp.tool
-@tolerant
-def auto_resize_columns(
-    spreadsheet_id: str,
-    sheet_id: int,
-    start_col: int = 0,
-    end_col: Optional[int] = None,
-) -> Any:
-    """Ajuste automatiquement la largeur des colonnes à leur contenu."""
-    dim_range = {
-        "sheetId": sheet_id,
-        "dimension": "COLUMNS",
-        "startIndex": start_col,
-    }
-    if end_col is not None:
-        dim_range["endIndex"] = end_col
-    _sheets().spreadsheets().batchUpdate(
-        spreadsheetId=spreadsheet_id,
-        body={"requests": [{"autoResizeDimensions": {"dimensions": dim_range}}]},
-    ).execute()
-    return {"colonnes_ajustees": True}
-
-
-# ---------------------------------------------------------------- échappatoire
-
-@mcp.tool
-@tolerant
-def batch_update(spreadsheet_id: str, requests: list) -> Any:
-    """Exécute des requêtes batchUpdate brutes de l'API Sheets.
-
-    À n'utiliser que pour les opérations non couvertes par les autres outils :
-    fusion de cellules, mise en forme conditionnelle, filtres, graphiques,
-    validation de données, protection de plages.
-    """
-    response = (
-        _sheets()
-        .spreadsheets()
-        .batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": requests})
-        .execute()
-    )
-    return {"requetes_executees": len(requests), "reponses": response.get("replies", [])}
-
-
-# ---------------------------------------------------------------- démarrage
-
-if __name__ == "__main__":
-    mcp.run(
-        transport="http",
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", "8080")),
-        path=os.environ.get("MCP_PATH", "/mcp"),
-    )
