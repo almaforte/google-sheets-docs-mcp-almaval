@@ -501,3 +501,188 @@ def format_range(
             {
                 "updateDimensionProperties": {
                     "range": dim_range,
+                    "properties": {"pixelSize": row_height},
+                    "fields": "pixelSize",
+                }
+            }
+        )
+
+    if not requests:
+        return {"erreur": "Aucune propriété de mise en forme fournie."}
+
+    _sheets().spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id, body={"requests": requests}
+    ).execute()
+    return {"mise_en_forme_appliquee": len(requests)}
+
+
+@mcp.tool
+@tolerant
+def apply_house_style(
+    spreadsheet_id: str,
+    sheet_id: int,
+    header_row: bool = True,
+    row_height: int = 30,
+    freeze_header: bool = True,
+) -> Any:
+    """Applique la convention de présentation d'Alberto à tout un onglet.
+
+    Cellules centrées horizontalement et verticalement, texte renvoyé à la
+    ligne, lignes hautes de 30 pixels, première ligne en gras et figée.
+    """
+    info = (
+        _sheets()
+        .spreadsheets()
+        .get(
+            spreadsheetId=spreadsheet_id,
+            fields="sheets.properties(sheetId,gridProperties)",
+        )
+        .execute()
+    )
+    row_count = 1000
+    for sheet in info.get("sheets", []):
+        if sheet["properties"]["sheetId"] == sheet_id:
+            row_count = sheet["properties"].get("gridProperties", {}).get("rowCount", 1000)
+
+    requests: list = [
+        {
+            "repeatCell": {
+                "range": {"sheetId": sheet_id},
+                "cell": {
+                    "userEnteredFormat": {
+                        "horizontalAlignment": "CENTER",
+                        "verticalAlignment": "MIDDLE",
+                        "wrapStrategy": "WRAP",
+                    }
+                },
+                "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment,wrapStrategy)",
+            }
+        },
+        {
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "dimension": "ROWS",
+                    "startIndex": 0,
+                    "endIndex": row_count,
+                },
+                "properties": {"pixelSize": row_height},
+                "fields": "pixelSize",
+            }
+        },
+    ]
+
+    if header_row:
+        requests.append(
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 0,
+                        "endRowIndex": 1,
+                    },
+                    "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
+                    "fields": "userEnteredFormat.textFormat.bold",
+                }
+            }
+        )
+
+    if freeze_header:
+        requests.append(
+            {
+                "updateSheetProperties": {
+                    "properties": {
+                        "sheetId": sheet_id,
+                        "gridProperties": {"frozenRowCount": 1},
+                    },
+                    "fields": "gridProperties.frozenRowCount",
+                }
+            }
+        )
+
+    _sheets().spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id, body={"requests": requests}
+    ).execute()
+    return {"style_applique": True, "lignes_traitees": row_count}
+
+
+@mcp.tool
+@tolerant
+def auto_resize_columns(
+    spreadsheet_id: str,
+    sheet_id: int,
+    start_col: int = 0,
+    end_col: Optional[int] = None,
+) -> Any:
+    """Ajuste automatiquement la largeur des colonnes à leur contenu."""
+    dim_range = {
+        "sheetId": sheet_id,
+        "dimension": "COLUMNS",
+        "startIndex": start_col,
+    }
+    if end_col is not None:
+        dim_range["endIndex"] = end_col
+    _sheets().spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={"requests": [{"autoResizeDimensions": {"dimensions": dim_range}}]},
+    ).execute()
+    return {"colonnes_ajustees": True}
+
+
+# ---------------------------------------------------------------- échappatoire
+
+@mcp.tool
+@tolerant
+def batch_update(spreadsheet_id: str, requests: list) -> Any:
+    """Exécute des requêtes batchUpdate brutes de l'API Sheets.
+
+    À n'utiliser que pour les opérations non couvertes par les autres outils :
+    fusion de cellules, mise en forme conditionnelle, filtres, graphiques,
+    validation de données, protection de plages.
+    """
+    response = (
+        _sheets()
+        .spreadsheets()
+        .batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": requests})
+        .execute()
+    )
+    return {"requetes_executees": len(requests), "reponses": response.get("replies", [])}
+
+
+# ---------------------------------------------------------------- démarrage
+
+class ApiKeyMiddleware(BaseHTTPMiddleware):
+    """Refuse toute requête ne portant pas la clé attendue.
+
+    La clé est acceptée sous deux formes, au choix du client :
+        Authorization: Bearer <cle>
+        X-API-Key: <cle>
+
+    Si MCP_API_KEY n'est pas définie, le contrôle est désactivé et le
+    serveur reste ouvert. À n'utiliser que le temps d'un test.
+    """
+
+    async def dispatch(self, request, call_next):
+        expected = os.environ.get("MCP_API_KEY", "")
+        if expected:
+            header = request.headers.get("authorization", "")
+            if header.lower().startswith("bearer "):
+                presented = header[7:].strip()
+            else:
+                presented = request.headers.get("x-api-key", "").strip()
+            if not hmac.compare_digest(presented, expected):
+                return JSONResponse(
+                    {"error": "unauthorized", "detail": "Clé API absente ou invalide."},
+                    status_code=401,
+                )
+        return await call_next(request)
+
+
+app = mcp.http_app(
+    path=os.environ.get("MCP_PATH", "/mcp"),
+    middleware=[Middleware(ApiKeyMiddleware)],
+)
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
