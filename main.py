@@ -2,17 +2,14 @@
 Serveur MCP Google Sheets — Almaval / Claude
 =============================================
 
-Authentification Google : compte de service avec délégation au niveau du domaine.
+Authentification : compte de service avec délégation au niveau du domaine.
 Le serveur agit sous l'identité de l'utilisateur défini par IMPERSONATE_USER,
 avec exactement ses droits, ni plus ni moins.
-
-Authentification du connecteur : clé API portée par un en-tête de requête.
 
 Variables d'environnement attendues :
     GOOGLE_SERVICE_ACCOUNT_JSON   contenu intégral du fichier JSON de la clé
     IMPERSONATE_USER              ex. am.forte@almaval.ch
-    MCP_API_KEY                   clé attendue dans l'en-tête des requêtes
-    MCP_PATH                      chemin d'écoute, ex. /mcp-sheets-a7f3d91c4e2b
+    MCP_PATH                      chemin d'écoute, ex. /mcp-sheets-8f3a91  (défaut /mcp)
     PORT                          fourni automatiquement par Railway
 """
 
@@ -22,9 +19,11 @@ import json
 import os
 from typing import Any, Optional
 
+import requests
 import uvicorn
 from fastmcp import FastMCP
 from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials as UserCredentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from starlette.middleware import Middleware
@@ -650,6 +649,263 @@ def batch_update(spreadsheet_id: str, requests: list) -> Any:
 
 
 # ---------------------------------------------------------------- démarrage
+
+# ================================================================
+#  APPS SCRIPT
+#  Identité distincte : jeton utilisateur, car l'API Apps Script
+#  ne fonctionne pas avec les comptes de service.
+# ================================================================
+
+SCRIPT_SCOPES = [
+    "https://www.googleapis.com/auth/script.projects",
+    "https://www.googleapis.com/auth/script.deployments",
+    "https://www.googleapis.com/auth/script.triggers",
+]
+
+
+def _user_credentials():
+    client_id = os.environ.get("GOOGLE_OAUTH_CLIENT_ID")
+    client_secret = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET")
+    refresh_token = os.environ.get("GOOGLE_OAUTH_REFRESH_TOKEN")
+    missing = [
+        name
+        for name, value in (
+            ("GOOGLE_OAUTH_CLIENT_ID", client_id),
+            ("GOOGLE_OAUTH_CLIENT_SECRET", client_secret),
+            ("GOOGLE_OAUTH_REFRESH_TOKEN", refresh_token),
+        )
+        if not value
+    ]
+    if missing:
+        raise RuntimeError("Variables absentes : " + ", ".join(missing))
+    return UserCredentials(
+        None,
+        refresh_token=refresh_token,
+        client_id=client_id,
+        client_secret=client_secret,
+        token_uri="https://oauth2.googleapis.com/token",
+        scopes=SCRIPT_SCOPES,
+    )
+
+
+def _script():
+    if "script" not in _services:
+        _services["script"] = build(
+            "script", "v1", credentials=_user_credentials(), cache_discovery=False
+        )
+    return _services["script"]
+
+
+DEFAULT_MANIFEST = {
+    "timeZone": "Europe/Zurich",
+    "dependencies": {},
+    "exceptionLogging": "STACKDRIVER",
+    "runtimeVersion": "V8",
+}
+
+WEBAPP_MANIFEST = dict(
+    DEFAULT_MANIFEST,
+    webapp={"access": "ANYONE_ANONYMOUS", "executeAs": "USER_DEPLOYING"},
+)
+
+
+@mcp.tool
+@tolerant
+def list_script_projects(name: str = "", limit: int = 20) -> Any:
+    """Liste les projets Apps Script du Drive.
+
+    name  : fragment du nom recherché, vide pour les plus récents
+    limit : nombre maximum de résultats
+    """
+    query = "mimeType='application/vnd.google-apps.script' and trashed=false"
+    if name:
+        query += " and name contains '{}'".format(name.replace("'", "\\'"))
+    result = (
+        _drive()
+        .files()
+        .list(
+            q=query,
+            pageSize=limit,
+            orderBy="modifiedTime desc",
+            fields="files(id,name,modifiedTime)",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        )
+        .execute()
+    )
+    return result.get("files", [])
+
+
+@mcp.tool
+@tolerant
+def create_script_project(title: str, parent_id: str = "") -> Any:
+    """Crée un projet Apps Script.
+
+    parent_id : identifiant d'un classeur ou document pour créer un script
+                lié à ce fichier. Vide pour un script autonome.
+    """
+    body: dict = {"title": title}
+    if parent_id:
+        body["parentId"] = parent_id
+    created = _script().projects().create(body=body).execute()
+    return {
+        "script_id": created["scriptId"],
+        "titre": created.get("title"),
+        "url": "https://script.google.com/d/{}/edit".format(created["scriptId"]),
+    }
+
+
+@mcp.tool
+@tolerant
+def get_script_content(script_id: str) -> Any:
+    """Lit le contenu complet d'un projet Apps Script.
+
+    Retourne chaque fichier avec son nom, son type et son code source.
+    """
+    content = _script().projects().getContent(scriptId=script_id).execute()
+    return {
+        "script_id": content.get("scriptId"),
+        "fichiers": [
+            {
+                "nom": f.get("name"),
+                "type": f.get("type"),
+                "source": f.get("source", ""),
+            }
+            for f in content.get("files", [])
+        ],
+    }
+
+
+@mcp.tool
+@tolerant
+def write_script_file(
+    script_id: str,
+    filename: str,
+    source: str,
+    file_type: str = "SERVER_JS",
+    webapp: bool = False,
+) -> Any:
+    """Écrit ou remplace un fichier dans un projet Apps Script.
+
+    Les autres fichiers du projet sont conservés tels quels.
+
+    filename  : nom sans extension, par exemple 'Code'
+    file_type : 'SERVER_JS' pour du code, 'HTML' pour une page
+    webapp    : si vrai, le manifeste est configuré pour une publication
+                en application web exécutée sous ton identité
+    """
+    current = _script().projects().getContent(scriptId=script_id).execute()
+    files = current.get("files", [])
+
+    manifest_present = any(f.get("name") == "appsscript" for f in files)
+    kept = [f for f in files if f.get("name") != filename]
+
+    if webapp or not manifest_present:
+        manifest = WEBAPP_MANIFEST if webapp else DEFAULT_MANIFEST
+        kept = [f for f in kept if f.get("name") != "appsscript"]
+        kept.append(
+            {
+                "name": "appsscript",
+                "type": "JSON",
+                "source": json.dumps(manifest, indent=2),
+            }
+        )
+
+    kept.append({"name": filename, "type": file_type, "source": source})
+
+    _script().projects().updateContent(
+        scriptId=script_id, body={"files": kept}
+    ).execute()
+    return {
+        "script_id": script_id,
+        "fichier_ecrit": filename,
+        "fichiers_totaux": len(kept),
+    }
+
+
+@mcp.tool
+@tolerant
+def deploy_web_app(script_id: str, description: str = "Déploiement Claude") -> Any:
+    """Crée une version et la publie en application web.
+
+    Retourne l'URL d'exécution, à utiliser ensuite avec run_web_app.
+    Le manifeste doit avoir été configuré avec webapp=True.
+    """
+    version = (
+        _script()
+        .projects()
+        .versions()
+        .create(scriptId=script_id, body={"description": description})
+        .execute()
+    )
+    deployment = (
+        _script()
+        .projects()
+        .deployments()
+        .create(
+            scriptId=script_id,
+            body={
+                "versionNumber": version["versionNumber"],
+                "manifestFileName": "appsscript",
+                "description": description,
+            },
+        )
+        .execute()
+    )
+    url = ""
+    for entry in deployment.get("entryPoints", []):
+        if entry.get("entryPointType") == "WEB_APP":
+            url = entry.get("webApp", {}).get("url", "")
+    return {
+        "deployment_id": deployment.get("deploymentId"),
+        "version": version["versionNumber"],
+        "url": url,
+    }
+
+
+@mcp.tool
+@tolerant
+def list_deployments(script_id: str) -> Any:
+    """Liste les déploiements existants d'un projet Apps Script."""
+    result = _script().projects().deployments().list(scriptId=script_id).execute()
+    sorties = []
+    for dep in result.get("deployments", []):
+        url = ""
+        for entry in dep.get("entryPoints", []):
+            if entry.get("entryPointType") == "WEB_APP":
+                url = entry.get("webApp", {}).get("url", "")
+        sorties.append(
+            {
+                "deployment_id": dep.get("deploymentId"),
+                "version": dep.get("deploymentConfig", {}).get("versionNumber"),
+                "description": dep.get("deploymentConfig", {}).get("description"),
+                "url": url,
+            }
+        )
+    return sorties
+
+
+@mcp.tool
+@tolerant
+def run_web_app(url: str, payload: Optional[dict] = None, timeout: int = 120) -> Any:
+    """Exécute une application web Apps Script déjà déployée.
+
+    Le secret partagé est ajouté automatiquement depuis la variable
+    SCRIPT_SHARED_SECRET, le script doit le vérifier avant d'agir.
+
+    url     : l'URL retournée par deploy_web_app
+    payload : dictionnaire transmis au script
+    """
+    body = dict(payload or {})
+    secret = os.environ.get("SCRIPT_SHARED_SECRET", "")
+    if secret:
+        body["secret"] = secret
+    response = requests.post(url, json=body, timeout=timeout)
+    try:
+        return {"statut": response.status_code, "reponse": response.json()}
+    except ValueError:
+        return {"statut": response.status_code, "reponse": response.text[:4000]}
+
 
 class ApiKeyMiddleware(BaseHTTPMiddleware):
     """Refuse toute requête ne portant pas la clé attendue.
