@@ -22,6 +22,7 @@ from typing import Any, Optional
 import requests
 import uvicorn
 from fastmcp import FastMCP
+from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials as UserCredentials
 from googleapiclient.discovery import build
@@ -657,6 +658,9 @@ def batch_update(spreadsheet_id: str, requests: list) -> Any:
 # ================================================================
 
 SCRIPT_SCOPES = [
+    "openid",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/drive.readonly",
     "https://www.googleapis.com/auth/script.projects",
     "https://www.googleapis.com/auth/script.deployments",
     "https://www.googleapis.com/auth/script.triggers",
@@ -705,7 +709,7 @@ DEFAULT_MANIFEST = {
 
 WEBAPP_MANIFEST = dict(
     DEFAULT_MANIFEST,
-    webapp={"access": "ANYONE_ANONYMOUS", "executeAs": "USER_DEPLOYING"},
+    webapp={"access": "MYSELF", "executeAs": "USER_DEPLOYING"},
 )
 
 
@@ -890,8 +894,9 @@ def list_deployments(script_id: str) -> Any:
 def run_web_app(url: str, payload: Optional[dict] = None, timeout: int = 120) -> Any:
     """Exécute une application web Apps Script déjà déployée.
 
-    Le secret partagé est ajouté automatiquement depuis la variable
-    SCRIPT_SHARED_SECRET, le script doit le vérifier avant d'agir.
+    L'appel est authentifié avec ton identité Google, puisque l'application
+    est publiée en accès réservé à toi seul. Le secret partagé est ajouté
+    en plus, depuis la variable SCRIPT_SHARED_SECRET.
 
     url     : l'URL retournée par deploy_web_app
     payload : dictionnaire transmis au script
@@ -900,11 +905,28 @@ def run_web_app(url: str, payload: Optional[dict] = None, timeout: int = 120) ->
     secret = os.environ.get("SCRIPT_SHARED_SECRET", "")
     if secret:
         body["secret"] = secret
-    response = requests.post(url, json=body, timeout=timeout)
+
+    creds = _user_credentials()
+    creds.refresh(GoogleAuthRequest())
+    headers = {"Authorization": "Bearer " + creds.token}
+
+    response = requests.post(
+        url, json=body, headers=headers, timeout=timeout, allow_redirects=False
+    )
+
+    # Une application web redirige vers googleusercontent.com. L'en-tête
+    # d'autorisation ne doit pas suivre la redirection, l'URL cible portant
+    # déjà son propre jeton.
+    if response.status_code in (301, 302, 303, 307, 308):
+        location = response.headers.get("location", "")
+        if location:
+            response = requests.get(location, timeout=timeout)
+
     try:
         return {"statut": response.status_code, "reponse": response.json()}
     except ValueError:
-        return {"statut": response.status_code, "reponse": response.text[:4000]}
+        return {"statut": response.status_code, "reponse": response.text[:2000]}
+
 
 
 class ApiKeyMiddleware(BaseHTTPMiddleware):
