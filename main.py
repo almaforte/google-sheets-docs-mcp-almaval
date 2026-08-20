@@ -201,25 +201,13 @@ def get_values(spreadsheet_id: str, range_a1: str, formulas: bool = False) -> An
 
 # ---------------------------------------------------------------- écriture
 
-@mcp.tool
-@tolerant
-def update_values(
+def _update_values(
     spreadsheet_id: str,
     range_a1: str,
     values: list,
     raw: bool = False,
 ) -> Any:
-    """Écrit une plage de cellules.
-
-    values : liste de listes, une liste par ligne
-    raw    : si vrai, le contenu est écrit littéralement sans interprétation.
-             Par défaut les formules et les dates sont interprétées comme
-             si elles étaient saisies au clavier.
-
-    Les noms de fonctions doivent être écrits en anglais avec la virgule
-    comme séparateur, par exemple =SUM(A1:A10). Le classeur les affichera
-    en français selon sa langue.
-    """
+    """Implémentation partagée par update_values et update_cell."""
     result = (
         _sheets()
         .spreadsheets()
@@ -242,9 +230,31 @@ def update_values(
 
 @mcp.tool
 @tolerant
+def update_values(
+    spreadsheet_id: str,
+    range_a1: str,
+    values: list,
+    raw: bool = False,
+) -> Any:
+    """Écrit une plage de cellules.
+
+    values : liste de listes, une liste par ligne
+    raw    : si vrai, le contenu est écrit littéralement sans interprétation.
+             Par défaut les formules et les dates sont interprétées comme
+             si elles étaient saisies au clavier.
+
+    Les noms de fonctions doivent être écrits en anglais avec la virgule
+    comme séparateur, par exemple =SUM(A1:A10). Le classeur les affichera
+    en français selon sa langue.
+    """
+    return _update_values(spreadsheet_id, range_a1, values, raw)
+
+
+@mcp.tool
+@tolerant
 def update_cell(spreadsheet_id: str, cell_a1: str, value: Any) -> Any:
     """Écrit une seule cellule, par exemple 'Feuille 1!C7'."""
-    return update_values(spreadsheet_id, cell_a1, [[value]])
+    return _update_values(spreadsheet_id, cell_a1, [[value]])
 
 
 @mcp.tool
@@ -649,8 +659,6 @@ def batch_update(spreadsheet_id: str, requests: list) -> Any:
     return {"requetes_executees": len(requests), "reponses": response.get("replies", [])}
 
 
-# ---------------------------------------------------------------- démarrage
-
 # ================================================================
 #  APPS SCRIPT
 #  Identité distincte : jeton utilisateur, car l'API Apps Script
@@ -700,17 +708,59 @@ def _script():
     return _services["script"]
 
 
+# Ces scopes sont déclarés dans le manifeste de chaque projet créé par le
+# serveur. Ils ne suppriment pas l'autorisation manuelle, qui reste à donner
+# une fois par projet depuis l'éditeur, mais ils la rendent complète du
+# premier coup : inutile de la redonner quand une action nouvelle touche un
+# service qui n'avait pas encore été consenti.
+PROJECT_OAUTH_SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/documents",
+    "https://www.googleapis.com/auth/presentations",
+    "https://www.googleapis.com/auth/script.external_request",
+    "https://www.googleapis.com/auth/script.scriptapp",
+    "https://www.googleapis.com/auth/userinfo.email",
+]
+
 DEFAULT_MANIFEST = {
     "timeZone": "Europe/Zurich",
     "dependencies": {},
     "exceptionLogging": "STACKDRIVER",
     "runtimeVersion": "V8",
+    "oauthScopes": PROJECT_OAUTH_SCOPES,
 }
 
-WEBAPP_MANIFEST = dict(
-    DEFAULT_MANIFEST,
-    webapp={"access": "MYSELF", "executeAs": "USER_DEPLOYING"},
-)
+# Accès par défaut des applications web publiées par le serveur.
+# MYSELF, et non ANYONE_ANONYMOUS : run_web_app présente un jeton Google du
+# compte propriétaire, l'accès réservé suffit donc et l'endpoint reste
+# inatteignable depuis l'extérieur. N'ouvrir en anonyme qu'au cas par cas,
+# via le paramètre access de write_script_file, pour un webhook public.
+DEFAULT_WEBAPP_ACCESS = "MYSELF"
+
+
+def _merge_manifest(existing_source: str, webapp: bool, access: str) -> str:
+    """Fusionne le manifeste existant au lieu de l'écraser.
+
+    Sans cette fusion, chaque écriture de fichier remettait le manifeste à
+    zéro et effaçait notamment les oauthScopes déclarés.
+    """
+    manifest: dict = {}
+    if existing_source:
+        try:
+            manifest = json.loads(existing_source)
+        except ValueError:
+            manifest = {}
+    if not isinstance(manifest, dict):
+        manifest = {}
+
+    for key, value in DEFAULT_MANIFEST.items():
+        manifest.setdefault(key, value)
+
+    if webapp:
+        manifest["webapp"] = {"access": access, "executeAs": "USER_DEPLOYING"}
+
+    return json.dumps(manifest, indent=2, ensure_ascii=False)
 
 
 @mcp.tool
@@ -747,6 +797,10 @@ def create_script_project(title: str, parent_id: str = "") -> Any:
 
     parent_id : identifiant d'un classeur ou document pour créer un script
                 lié à ce fichier. Vide pour un script autonome.
+
+    Rappel : un projet neuf devra être autorisé une fois manuellement depuis
+    l'éditeur, en exécutant n'importe quelle fonction et en acceptant les
+    permissions. Sans cela l'application web répondra « Authorization needed ».
     """
     body: dict = {"title": title}
     if parent_id:
@@ -756,6 +810,10 @@ def create_script_project(title: str, parent_id: str = "") -> Any:
         "script_id": created["scriptId"],
         "titre": created.get("title"),
         "url": "https://script.google.com/d/{}/edit".format(created["scriptId"]),
+        "rappel": (
+            "Autoriser une fois le projet depuis l'éditeur avant d'appeler "
+            "run_web_app."
+        ),
     }
 
 
@@ -788,33 +846,50 @@ def write_script_file(
     source: str,
     file_type: str = "SERVER_JS",
     webapp: bool = False,
+    access: str = DEFAULT_WEBAPP_ACCESS,
 ) -> Any:
     """Écrit ou remplace un fichier dans un projet Apps Script.
 
-    Les autres fichiers du projet sont conservés tels quels.
+    Les autres fichiers du projet sont conservés tels quels, et le manifeste
+    est fusionné plutôt qu'écrasé : les clés déjà présentes survivent.
 
     filename  : nom sans extension, par exemple 'Code'
     file_type : 'SERVER_JS' pour du code, 'HTML' pour une page
     webapp    : si vrai, le manifeste est configuré pour une publication
                 en application web exécutée sous ton identité
+    access    : 'MYSELF' par défaut, l'appel de run_web_app étant authentifié.
+                'ANYONE_ANONYMOUS' n'est à utiliser que pour un webhook
+                réellement public, appelé par un tiers sans jeton Google.
     """
     current = _script().projects().getContent(scriptId=script_id).execute()
     files = current.get("files", [])
 
-    manifest_present = any(f.get("name") == "appsscript" for f in files)
-    kept = [f for f in files if f.get("name") != filename]
+    # Cas particulier : on écrit directement le manifeste, il passe tel quel.
+    if filename == "appsscript":
+        kept = [f for f in files if f.get("name") != "appsscript"]
+        kept.append({"name": "appsscript", "type": "JSON", "source": source})
+        _script().projects().updateContent(
+            scriptId=script_id, body={"files": kept}
+        ).execute()
+        return {
+            "script_id": script_id,
+            "fichier_ecrit": "appsscript",
+            "fichiers_totaux": len(kept),
+        }
 
-    if webapp or not manifest_present:
-        manifest = WEBAPP_MANIFEST if webapp else DEFAULT_MANIFEST
-        kept = [f for f in kept if f.get("name") != "appsscript"]
-        kept.append(
-            {
-                "name": "appsscript",
-                "type": "JSON",
-                "source": json.dumps(manifest, indent=2),
-            }
-        )
+    existing_manifest = ""
+    for f in files:
+        if f.get("name") == "appsscript":
+            existing_manifest = f.get("source", "")
 
+    kept = [f for f in files if f.get("name") not in (filename, "appsscript")]
+    kept.append(
+        {
+            "name": "appsscript",
+            "type": "JSON",
+            "source": _merge_manifest(existing_manifest, webapp, access),
+        }
+    )
     kept.append({"name": filename, "type": file_type, "source": source})
 
     _script().projects().updateContent(
@@ -824,6 +899,7 @@ def write_script_file(
         "script_id": script_id,
         "fichier_ecrit": filename,
         "fichiers_totaux": len(kept),
+        "acces_webapp": access if webapp else None,
     }
 
 
@@ -894,9 +970,13 @@ def list_deployments(script_id: str) -> Any:
 def run_web_app(url: str, payload: Optional[dict] = None, timeout: int = 120) -> Any:
     """Exécute une application web Apps Script déjà déployée.
 
-    L'appel est authentifié avec ton identité Google, puisque l'application
-    est publiée en accès réservé à toi seul. Le secret partagé est ajouté
-    en plus, depuis la variable SCRIPT_SHARED_SECRET.
+    L'appel est authentifié avec ton identité Google, ce qui permet à
+    l'application de rester publiée en accès réservé. Le secret partagé est
+    ajouté en plus, depuis la variable SCRIPT_SHARED_SECRET.
+
+    Si la réponse contient « Authorization needed », c'est que le projet n'a
+    jamais été autorisé depuis l'éditeur. Cette autorisation est manuelle,
+    vaut pour un projet donné et ne peut pas être donnée par l'API.
 
     url     : l'URL retournée par deploy_web_app
     payload : dictionnaire transmis au script
@@ -925,9 +1005,20 @@ def run_web_app(url: str, payload: Optional[dict] = None, timeout: int = 120) ->
     try:
         return {"statut": response.status_code, "reponse": response.json()}
     except ValueError:
-        return {"statut": response.status_code, "reponse": response.text[:2000]}
+        texte = response.text[:2000]
+        if "Authorization needed" in response.text:
+            return {
+                "statut": response.status_code,
+                "erreur": "Projet non autorisé.",
+                "detail": (
+                    "Ouvrir le projet dans l'éditeur Apps Script, exécuter une "
+                    "fonction et accepter les permissions, puis relancer."
+                ),
+            }
+        return {"statut": response.status_code, "reponse": texte}
 
 
+# ---------------------------------------------------------------- démarrage
 
 class ApiKeyMiddleware(BaseHTTPMiddleware):
     """Refuse toute requête ne portant pas la clé attendue.
