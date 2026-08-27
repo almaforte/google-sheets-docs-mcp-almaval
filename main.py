@@ -341,12 +341,18 @@ def create_spreadsheet(
     )
     file_id = created["spreadsheetId"]
     if folder_id:
-        current = _drive().files().get(fileId=file_id, fields="parents").execute()
+        current = (
+            _drive()
+            .files()
+            .get(fileId=file_id, fields="parents", supportsAllDrives=True)
+            .execute()
+        )
         _drive().files().update(
             fileId=file_id,
             addParents=folder_id,
             removeParents=",".join(current.get("parents", [])),
             fields="id,parents",
+            supportsAllDrives=True,
         ).execute()
     return {"spreadsheet_id": file_id, "url": created["spreadsheetUrl"]}
 
@@ -2129,7 +2135,12 @@ def export_pdf(document_id: str, name: str = "", folder_id: str = "") -> Any:
     name      : nom du PDF, sans extension. Par défaut, le titre du document
     folder_id : dossier de destination, par défaut la racine du Drive
     """
-    meta = _drive().files().get(fileId=document_id, fields="name").execute()
+    meta = (
+        _drive()
+        .files()
+        .get(fileId=document_id, fields="name", supportsAllDrives=True)
+        .execute()
+    )
     titre = name or meta.get("name", "document")
     donnees = (
         _drive()
@@ -2146,7 +2157,12 @@ def export_pdf(document_id: str, name: str = "", folder_id: str = "") -> Any:
     cree = (
         _drive()
         .files()
-        .create(body=corps, media_body=media, fields="id,name,webViewLink")
+        .create(
+            body=corps,
+            media_body=media,
+            fields="id,name,webViewLink",
+            supportsAllDrives=True,
+        )
         .execute()
     )
     return {
