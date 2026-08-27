@@ -722,6 +722,13 @@ DOC_BODY_ALIGNMENT = "JUSTIFIED"
 DOC_HEADING_ALIGNMENT = "START"
 DOC_LIST_ALIGNMENT = "JUSTIFIED"
 
+# Listes a puces, rendues avec un vrai trait plutot qu'avec un glyphe de
+# liste natif. Un retrait en drapeau, la ligne du trait moins indentee que
+# les lignes suivantes d'un meme element qui passent a la ligne.
+DOC_BULLET_TEXT = "-  "  # trait, deux espaces, avant le texte visible
+DOC_LIST_INDENT_START = 36   # points, lignes de continuation
+DOC_LIST_INDENT_FIRST = 18   # points, ligne du trait
+
 # Couleur d'un titre selon son niveau.
 DOC_HEADING_COLORS = {1: COLOR_TEAL, 2: COLOR_GOLD, 3: COLOR_GOLD}
 
@@ -809,6 +816,8 @@ def _doc_paragraph_style(
     named: str = "NORMAL_TEXT",
     space_before: float = DOC_SPACE_BEFORE,
     space_after: float = DOC_SPACE_AFTER,
+    indent_start: float = None,
+    indent_first: float = None,
 ) -> tuple:
     style = {
         "namedStyleType": named,
@@ -818,6 +827,12 @@ def _doc_paragraph_style(
         "spaceBelow": _pt(space_after),
     }
     fields = "namedStyleType,alignment,lineSpacing,spaceAbove,spaceBelow"
+    if indent_start is not None:
+        style["indentStart"] = _pt(indent_start)
+        fields += ",indentStart"
+    if indent_first is not None:
+        style["indentFirstLine"] = _pt(indent_first)
+        fields += ",indentFirstLine"
     return style, fields
 
 
@@ -1005,16 +1020,20 @@ def _requetes_segment_texte(blocs: list, index_depart: int) -> tuple:
 
     for bloc in blocs:
         clair, passages = _parse_inline(bloc["texte"])
+        prefixe = DOC_BULLET_TEXT if bloc["genre"] == "puce" else ""
         debut = len(texte)
-        texte += clair + "\n"
+        texte += prefixe + clair + "\n"
         metadonnees.append(
             {
                 "bloc": bloc,
                 "debut": index_depart + debut,
+                "prefixe_fin": index_depart + debut + len(prefixe),
                 "fin": index_depart + len(texte),
-                "fin_texte": index_depart + debut + len(clair),
+                "fin_texte": index_depart + debut + len(prefixe) + len(clair),
                 "passages": passages,
-                "origine": index_depart + debut,
+                # Les passages en ligne (gras, italique, lien) sont calcules
+                # sur le texte visible, donc leur origine saute le prefixe.
+                "origine": index_depart + debut + len(prefixe),
             }
         )
 
@@ -1037,7 +1056,17 @@ def _requetes_segment_texte(blocs: list, index_depart: int) -> tuple:
             style_t, champs_t = _doc_text_style(
                 bold=True, color=DOC_HEADING_COLORS.get(niveau, COLOR_TEAL)
             )
-        elif genre in ("puce", "numero"):
+        elif genre == "puce":
+            # Pas de liste native : un trait reel en tete de paragraphe, sa
+            # couleur est donc un style de texte ordinaire, fiable a
+            # l'export PDF, contrairement au marqueur d'une liste native.
+            style_p, champs_p = _doc_paragraph_style(
+                alignment=DOC_LIST_ALIGNMENT,
+                indent_start=DOC_LIST_INDENT_START,
+                indent_first=DOC_LIST_INDENT_FIRST,
+            )
+            style_t, champs_t = _doc_text_style()
+        elif genre == "numero":
             style_p, champs_p = _doc_paragraph_style(alignment=DOC_LIST_ALIGNMENT)
             style_t, champs_t = _doc_text_style()
         else:
@@ -1054,12 +1083,27 @@ def _requetes_segment_texte(blocs: list, index_depart: int) -> tuple:
             }
         )
 
-        if meta["fin_texte"] > meta["debut"]:
+        if genre == "puce" and meta["prefixe_fin"] > meta["debut"]:
+            style_trait, champs_trait = _doc_text_style(color=COLOR_TEAL)
             requetes.append(
                 {
                     "updateTextStyle": {
                         "range": {
                             "startIndex": meta["debut"],
+                            "endIndex": meta["prefixe_fin"],
+                        },
+                        "textStyle": style_trait,
+                        "fields": champs_trait,
+                    }
+                }
+            )
+
+        if meta["fin_texte"] > meta["prefixe_fin"]:
+            requetes.append(
+                {
+                    "updateTextStyle": {
+                        "range": {
+                            "startIndex": meta["prefixe_fin"],
                             "endIndex": meta["fin_texte"],
                         },
                         "textStyle": style_t,
@@ -1096,20 +1140,14 @@ def _requetes_segment_texte(blocs: list, index_depart: int) -> tuple:
                 }
             )
 
-    # Les puces se posent en dernier, une requête par groupe contigu, car
-    # createParagraphBullets ajoute un retrait que updateParagraphStyle
-    # effacerait s'il passait ensuite.
+    # Seules les listes numerotees restent des listes natives ; le trait des
+    # puces est un simple caractere de texte, pose plus haut, groupe par
+    # groupe contigu n'a donc plus de sens que pour les numeros.
     groupe: list = []
-    genre_groupe = ""
 
     def vider_groupe():
         if not groupe:
             return
-        preset = (
-            "BULLET_DISC_CIRCLE_SQUARE"
-            if genre_groupe == "puce"
-            else "NUMBERED_DECIMAL_ALPHA_ROMAN"
-        )
         requetes.append(
             {
                 "createParagraphBullets": {
@@ -1117,23 +1155,18 @@ def _requetes_segment_texte(blocs: list, index_depart: int) -> tuple:
                         "startIndex": groupe[0]["debut"],
                         "endIndex": groupe[-1]["fin"],
                     },
-                    "bulletPreset": preset,
+                    "bulletPreset": "NUMBERED_DECIMAL_ALPHA_ROMAN",
                 }
             }
         )
 
     for meta in metadonnees:
         genre = meta["bloc"]["genre"]
-        if genre in ("puce", "numero"):
-            if genre != genre_groupe:
-                vider_groupe()
-                groupe = []
-                genre_groupe = genre
+        if genre == "numero":
             groupe.append(meta)
         else:
             vider_groupe()
             groupe = []
-            genre_groupe = ""
     vider_groupe()
 
     return requetes, len(texte)
@@ -1152,7 +1185,14 @@ def _listes_numerotees(document: dict) -> set:
 
 
 def _grouper_puces(document: dict) -> list:
-    """Regroupe les paragraphes a puce, non numerotes, contigus dans le texte."""
+    """Regroupe les paragraphes a puce native, non numerotes, contigus.
+
+    Ne concerne que les listes crees par createParagraphBullets, c'est a
+    dire d'anciens documents ecrits avant que les puces ne deviennent un
+    trait de texte ordinaire. Un document ecrit par la version courante de
+    write_markdown n'a plus de champ bullet du tout sur ses paragraphes a
+    puce, donc ne remonte jamais ici.
+    """
     numerotees = _listes_numerotees(document)
     groupes: list = []
     groupe_courant: list = []
@@ -1180,13 +1220,7 @@ def _grouper_puces(document: dict) -> list:
             fin_precedente = None
             continue
 
-        premier = ""
-        for sous in paragraphe.get("elements", []):
-            premier = sous.get("textRun", {}).get("content", "")
-            if premier:
-                break
-
-        info = {"debut": debut, "fin": fin, "a_zwsp": premier.startswith(DOC_ZWSP)}
+        info = {"debut": debut, "fin": fin}
         if groupe_courant and fin_precedente == debut:
             groupe_courant.append(info)
         else:
@@ -1199,36 +1233,32 @@ def _grouper_puces(document: dict) -> list:
 
 
 def _requetes_puces_teal(document: dict) -> list:
-    """Colore en teal le marqueur des listes a puces.
+    """Convertit les listes a puces natives en trait de texte teal.
 
-    L'API Docs ne permet pas de styler un marqueur directement, et fige sa
-    couleur au moment de createParagraphBullets, a partir du style alors en
-    vigueur sur le premier caractere du paragraphe. Une analyse octet par
-    octet du PDF exporte a confirme qu'une recoloration posterieure du texte
-    ne change rien au marqueur deja cree, meme quand elle porte sur ce meme
-    premier caractere.
+    L'API Docs ne permet pas de styler le marqueur d'une liste native, et
+    une analyse octet par octet du PDF exporte a confirme qu'aucune
+    recoloration, quel que soit son moment, n'affecte sa couleur : le
+    moteur d'export semble l'ignorer purement et simplement. La seule
+    voie fiable est de ne pas utiliser de liste native du tout.
 
-    La correction retire donc les puces existantes, colore en teal un
-    caractere de largeur nulle place en tete de chaque paragraphe, puis
-    recree les puces. Le marqueur nait alors directement en teal, le texte
-    visible restant gris. Le caractere est retire par read_document_text,
-    mais il reste present dans le document, donc une recherche replace_text
-    portant sur le tout premier mot d'un item de liste ne le trouvera pas.
+    Cette fonction ne concerne donc que les documents plus anciens qui
+    portent encore de vraies puces createParagraphBullets. Elle les
+    retire, et les remplace par un trait reel en tete de paragraphe,
+    colore en teal comme n'importe quel texte, avec un retrait en
+    drapeau pose a la main. Les documents ecrits par la version courante
+    de write_markdown n'ont plus jamais de puce native, donc cette
+    fonction n'y trouve rien a faire.
     """
     groupes = _grouper_puces(document)
     if not groupes:
         return []
 
-    style, champs = _doc_text_style(color=COLOR_TEAL)
-
-    def coloration(depart: int, arrivee: int) -> dict:
-        return {
-            "updateTextStyle": {
-                "range": {"startIndex": depart, "endIndex": arrivee},
-                "textStyle": style,
-                "fields": champs,
-            }
-        }
+    style_trait, champs_trait = _doc_text_style(color=COLOR_TEAL)
+    style_p, champs_p = _doc_paragraph_style(
+        alignment=DOC_LIST_ALIGNMENT,
+        indent_start=DOC_LIST_INDENT_START,
+        indent_first=DOC_LIST_INDENT_FIRST,
+    )
 
     requetes: list = []
 
@@ -1240,25 +1270,33 @@ def _requetes_puces_teal(document: dict) -> list:
         # A l'interieur d'un groupe, meme logique, du dernier paragraphe
         # au premier.
         for info in sorted(groupe, key=lambda i: i["debut"], reverse=True):
-            if info["a_zwsp"]:
-                requetes.append(coloration(info["debut"], info["debut"] + 1))
-            else:
-                requetes.append(
-                    {
-                        "insertText": {
-                            "location": {"index": info["debut"]},
-                            "text": DOC_ZWSP,
-                        }
+            requetes.append(
+                {
+                    "insertText": {
+                        "location": {"index": info["debut"]},
+                        "text": DOC_BULLET_TEXT,
                     }
-                )
-                requetes.append(coloration(info["debut"], info["debut"] + 1))
-                insertions += 1
+                }
+            )
+            requetes.append(
+                {
+                    "updateTextStyle": {
+                        "range": {
+                            "startIndex": info["debut"],
+                            "endIndex": info["debut"] + len(DOC_BULLET_TEXT),
+                        },
+                        "textStyle": style_trait,
+                        "fields": champs_trait,
+                    }
+                }
+            )
+            insertions += len(DOC_BULLET_TEXT)
 
         debut_groupe = groupe[0]["debut"]
         fin_groupe = groupe[-1]["fin"] + insertions
 
-        # La couleur doit etre en place avant la recreation de la puce,
-        # jamais apres, sans quoi le marqueur repart grise.
+        # deleteParagraphBullets peut reinitialiser le retrait : l'indentation
+        # en drapeau se pose donc apres, sur la plage entiere du groupe.
         requetes.append(
             {
                 "deleteParagraphBullets": {
@@ -1268,14 +1306,23 @@ def _requetes_puces_teal(document: dict) -> list:
         )
         requetes.append(
             {
-                "createParagraphBullets": {
+                "updateParagraphStyle": {
                     "range": {"startIndex": debut_groupe, "endIndex": fin_groupe},
-                    "bulletPreset": "BULLET_DISC_CIRCLE_SQUARE",
+                    "paragraphStyle": style_p,
+                    "fields": champs_p,
                 }
             }
         )
 
     return requetes
+
+
+def _texte_paragraphe_brut(paragraphe: dict) -> str:
+    """Concatene le texte d'un paragraphe, tel quel, caracteres invisibles compris."""
+    morceaux = []
+    for element in paragraphe.get("elements", []):
+        morceaux.append(element.get("textRun", {}).get("content", ""))
+    return "".join(morceaux)
 
 
 def _trouver_tableau(document: dict, index_minimal: int):
@@ -1742,7 +1789,7 @@ def clear_document(document_id: str) -> Any:
 # ------------------------------------------------ outils Docs, écriture
 
 def _appliquer_puces_teal(document_id: str) -> int:
-    """Relit le document et colore le marqueur des listes a puces."""
+    """Relit le document et convertit d'eventuelles puces natives restantes."""
     requetes = _requetes_puces_teal(_doc_get(document_id))
     if not requetes:
         return 0
@@ -1835,12 +1882,13 @@ def replace_text(
     Fonctionne aussi dans les en-têtes, les pieds de page et les tableaux,
     ce qui en fait l'outil de choix pour remplir un gabarit à champs.
 
-    Deux limites à connaître. Remplacer par une chaîne vide vide le
-    paragraphe sans le supprimer, il reste un paragraphe blanc. Et un
-    caractère de largeur nulle ouvre chaque élément de liste à puces, pour
-    porter la couleur du marqueur, donc une recherche qui commence au tout
-    premier mot d'un tel élément ne le trouvera pas. Chercher à partir du
-    deuxième mot, ou décaler la recherche d'un mot.
+    Une limite à connaître. Remplacer par une chaîne vide vide le
+    paragraphe sans le supprimer, il reste un paragraphe blanc.
+
+    Un élément de liste à puces s'ouvre par un trait réel, "-  ", qui fait
+    partie du texte : une recherche portant sur le tout premier mot visible
+    d'un tel élément le trouve sans problème, mais chercher le trait lui
+    même le trouverait aussi, sur tous les éléments de liste à la fois.
     """
     reponse = (
         _docs()
@@ -2101,6 +2149,9 @@ def apply_house_style_doc(document_id: str, alignment: str = DOC_BODY_ALIGNMENT)
         )
         plage = {"startIndex": debut, "endIndex": fin}
 
+        texte_brut = _texte_paragraphe_brut(element["paragraph"])
+        est_puce_trait = cellule is None and texte_brut.startswith(DOC_BULLET_TEXT)
+
         if cellule is not None:
             # Dans un tableau, c'est le fond de la cellule qui decide, jamais
             # la position de la ligne. Un fond soutenu impose du texte blanc,
@@ -2128,6 +2179,17 @@ def apply_house_style_doc(document_id: str, alignment: str = DOC_BODY_ALIGNMENT)
                 bold=True, color=DOC_HEADING_COLORS.get(niveau, COLOR_TEAL)
             )
             titres += 1
+        elif est_puce_trait:
+            # Le trait en tete de paragraphe est un texte ordinaire, pas un
+            # marqueur de liste : le regriser avec le reste du paragraphe
+            # effacerait la seule correction qui rend la puce lisible.
+            style_p, champs_p = _doc_paragraph_style(
+                alignment=DOC_LIST_ALIGNMENT,
+                indent_start=DOC_LIST_INDENT_START,
+                indent_first=DOC_LIST_INDENT_FIRST,
+            )
+            style_t, champs_t = _doc_text_style()
+            paragraphes += 1
         else:
             style_p, champs_p = _doc_paragraph_style(alignment=alignment)
             style_t, champs_t = _doc_text_style()
@@ -2142,6 +2204,36 @@ def apply_house_style_doc(document_id: str, alignment: str = DOC_BODY_ALIGNMENT)
                 }
             }
         )
+
+        if est_puce_trait:
+            style_trait, champs_trait = _doc_text_style(color=COLOR_TEAL)
+            requetes.append(
+                {
+                    "updateTextStyle": {
+                        "range": {
+                            "startIndex": debut,
+                            "endIndex": debut + len(DOC_BULLET_TEXT),
+                        },
+                        "textStyle": style_trait,
+                        "fields": champs_trait,
+                    }
+                }
+            )
+            if fin - 1 > debut + len(DOC_BULLET_TEXT):
+                requetes.append(
+                    {
+                        "updateTextStyle": {
+                            "range": {
+                                "startIndex": debut + len(DOC_BULLET_TEXT),
+                                "endIndex": fin - 1,
+                            },
+                            "textStyle": style_t,
+                            "fields": champs_t,
+                        }
+                    }
+                )
+            continue
+
         if fin - 1 > debut:
             requetes.append(
                 {
@@ -2158,9 +2250,9 @@ def apply_house_style_doc(document_id: str, alignment: str = DOC_BODY_ALIGNMENT)
 
     envoyees = _doc_batch(document_id, requetes)
 
-    # Les puces se colorent apres coup, sur un document relu, car la passe
-    # precedente vient de repeindre tout le texte en gris et emporterait le
-    # teal du marqueur.
+    # D'anciennes puces natives, s'il en reste, sont converties en trait de
+    # texte teal apres coup, sur un document relu, car l'operation insere du
+    # texte et decale les index.
     requetes_puces = _requetes_puces_teal(_doc_get(document_id))
     if requetes_puces:
         envoyees += _doc_batch(document_id, requetes_puces)
@@ -2170,7 +2262,7 @@ def apply_house_style_doc(document_id: str, alignment: str = DOC_BODY_ALIGNMENT)
         "titres": titres,
         "paragraphes": paragraphes,
         "cellules_sur_fond_soutenu": cellules_soutenues,
-        "puces_colorees": len(requetes_puces),
+        "puces_converties": len(requetes_puces),
     }
 
 
