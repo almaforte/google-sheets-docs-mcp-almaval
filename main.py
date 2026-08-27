@@ -694,7 +694,7 @@ def batch_update(spreadsheet_id: str, requests: list) -> Any:
 # Gabarit institutionnel. Toute production part d'une copie de ce document,
 # dont elle hérite l'en-tête, le pied de page et les marges. Le gabarit
 # lui-même n'est jamais modifié.
-DOC_TEMPLATE_ID = "11fMPOO7Xh0ZvThwzNUU-PN6xhx4IsCBD4dva7URx9IA"
+DOC_TEMPLATE_ID = "1024m5Jtwqgdk6r9T4fEUVFg8mVbW9BlPrguqasrE37U"
 
 DOC_FONT = "Manjari"
 DOC_FONT_SIZE = 11  # taille unique, titres compris
@@ -723,6 +723,50 @@ DOC_TABLE_BORDER_WIDTH = 0.5  # points
 
 # Nombre maximal de requêtes envoyées dans un même batchUpdate.
 DOC_BATCH_SIZE = 150
+
+
+DOC_ZWSP = "\u200b"  # caractere invisible portant la couleur de la puce
+DOC_BULLET_MODE = "invisible"  # "invisible" ou "premier_caractere"
+
+
+def _rgb_from_color(color: dict) -> tuple:
+    """Extrait un triplet 0..1 d'un objet OptionalColor de l'API Docs."""
+    if not color:
+        return ()
+    rgb = color.get("color", {}).get("rgbColor", {})
+    if not rgb and "rgbColor" in color:
+        rgb = color["rgbColor"]
+    if not rgb:
+        return ()
+    return (
+        float(rgb.get("red", 0.0)),
+        float(rgb.get("green", 0.0)),
+        float(rgb.get("blue", 0.0)),
+    )
+
+
+def _luminance(rgb: tuple) -> float:
+    """Luminance relative approchee, 0 pour le noir, 1 pour le blanc."""
+    if not rgb:
+        return 1.0
+    r, v, b = rgb
+    return 0.2126 * r + 0.7152 * v + 0.0722 * b
+
+
+def _fond_soutenu(cellule: dict) -> bool:
+    """Vrai si le fond de la cellule est assez sombre pour exiger du texte blanc.
+
+    Le critere est le fond reel de la cellule, jamais la position de la ligne.
+    Une ligne de total mise en couleur plus bas dans le tableau est traitee
+    comme une ligne d'en-tete, ce qui est le comportement voulu.
+    """
+    if not cellule:
+        return False
+    fond = cellule.get("tableCellStyle", {}).get("backgroundColor")
+    rgb = _rgb_from_color(fond)
+    if not rgb:
+        return False
+    return _luminance(rgb) < 0.6
 
 
 def _doc_color(hex_value: str) -> dict:
@@ -798,18 +842,24 @@ def _doc_end_index(document: dict) -> int:
 
 
 def _iter_paragraphs(document: dict):
-    """Parcourt tous les paragraphes, y compris ceux des cellules de tableau."""
+    """Parcourt tous les paragraphes, cellules de tableau comprises.
 
-    def parcourir(elements):
+    Rend un couple, le paragraphe et la cellule qui le contient, cette
+    derniere valant None hors tableau. Sans cette information l'appelant
+    ne peut pas distinguer un paragraphe de corps d'une cellule, et repeint
+    les en-tetes de tableau en gris.
+    """
+
+    def parcourir(elements, cellule_courante):
         for element in elements:
             if "paragraph" in element:
-                yield element
+                yield element, cellule_courante
             elif "table" in element:
                 for ligne in element["table"].get("tableRows", []):
                     for cellule in ligne.get("tableCells", []):
-                        yield from parcourir(cellule.get("content", []))
+                        yield from parcourir(cellule.get("content", []), cellule)
 
-    yield from parcourir(document.get("body", {}).get("content", []))
+    yield from parcourir(document.get("body", {}).get("content", []), None)
 
 
 # ------------------------------------------------ analyse du markdown
@@ -1084,6 +1134,97 @@ def _requetes_segment_texte(blocs: list, index_depart: int) -> tuple:
     return requetes, len(texte)
 
 
+def _listes_numerotees(document: dict) -> set:
+    """Identifiants des listes dont le premier niveau est numerote."""
+    numerotees = set()
+    for list_id, liste in (document.get("lists") or {}).items():
+        niveaux = liste.get("listProperties", {}).get("nestingLevels", [])
+        if not niveaux:
+            continue
+        if niveaux[0].get("glyphType"):
+            numerotees.add(list_id)
+    return numerotees
+
+
+def _requetes_puces_teal(document: dict) -> list:
+    """Colore en teal le marqueur des listes a puces.
+
+    L'API Docs ne permet pas de styler un marqueur directement. Le marqueur
+    reprend le style de la premiere portion de texte du paragraphe, ce qui
+    laisse deux voies.
+
+    invisible          un caractere de largeur nulle est place en tete du
+                       paragraphe et colore en teal. Le marqueur devient teal
+                       et le texte visible reste gris, conforme a la charte.
+                       Le caractere est retire par read_document_text, mais il
+                       reste present dans le document, donc une recherche
+                       replace_text portant sur le tout premier mot d'un item
+                       de liste ne le trouvera pas.
+
+    premier_caractere  la premiere lettre visible passe en teal. Aucun
+                       caractere ajoute, mais cette lettre est teal a l'ecran.
+
+    Le mode est fixe par DOC_BULLET_MODE.
+    """
+    numerotees = _listes_numerotees(document)
+    insertions: list = []
+    colorations: list = []
+
+    for element, _cellule in _iter_paragraphs(document):
+        paragraphe = element["paragraph"]
+        puce = paragraphe.get("bullet")
+        if puce is None or puce.get("listId") in numerotees:
+            continue
+        debut = element.get("startIndex")
+        fin = element.get("endIndex")
+        if debut is None or fin is None or fin - 1 <= debut:
+            continue
+
+        premier = ""
+        for sous in paragraphe.get("elements", []):
+            premier = sous.get("textRun", {}).get("content", "")
+            if premier:
+                break
+
+        if DOC_BULLET_MODE == "invisible":
+            if premier.startswith(DOC_ZWSP):
+                colorations.append((debut, debut + 1))
+                continue
+            insertions.append(debut)
+        else:
+            colorations.append((debut, debut + 1))
+
+    style, champs = _doc_text_style(color=COLOR_TEAL)
+
+    def coloration(depart: int, arrivee: int) -> dict:
+        return {
+            "updateTextStyle": {
+                "range": {"startIndex": depart, "endIndex": arrivee},
+                "textStyle": style,
+                "fields": champs,
+            }
+        }
+
+    requetes: list = []
+
+    # Les plages deja connues sont traitees en premier, tant que le document
+    # porte encore ses index d'origine.
+    for depart, arrivee in colorations:
+        requetes.append(coloration(depart, arrivee))
+
+    # Les insertions vont ensuite a rebours, et chaque coloration suit
+    # immediatement son insertion. Grouper toutes les insertions puis toutes
+    # les colorations serait faux, car chaque insertion decale d'une unite
+    # tout ce qui la suit dans le document.
+    for position in sorted(insertions, reverse=True):
+        requetes.append(
+            {"insertText": {"location": {"index": position}, "text": DOC_ZWSP}}
+        )
+        requetes.append(coloration(position, position + 1))
+
+    return requetes
+
+
 def _trouver_tableau(document: dict, index_minimal: int):
     """Retrouve le premier tableau situé à partir d'un index donné."""
     for element in document.get("body", {}).get("content", []):
@@ -1188,6 +1329,50 @@ def _styler_tableau(element_tableau: dict, avec_entete: bool) -> list:
     return requetes
 
 
+def _supprimer_paragraphe_vide_avant(document_id: str, index: int) -> bool:
+    """Retire le paragraphe vide que l'API cree au dessus d'un tableau.
+
+    insertTable et l'insertion d'un encadre laissent systematiquement un
+    paragraphe vide juste avant la structure inseree, visible comme un blanc
+    supplementaire dans le PDF. Il n'est supprime que s'il est reellement vide
+    et qu'il n'ouvre pas le corps du document, l'API refusant un corps qui ne
+    commencerait pas par un paragraphe.
+    """
+    document = _doc_get(document_id)
+    contenu = document.get("body", {}).get("content", [])
+    for rang, element in enumerate(contenu):
+        if "table" not in element:
+            continue
+        if element.get("startIndex", 0) < index:
+            continue
+        if rang == 0:
+            return False
+        precedent = contenu[rang - 1]
+        if "paragraph" not in precedent:
+            return False
+        debut = precedent.get("startIndex")
+        fin = precedent.get("endIndex")
+        if debut is None or fin is None or fin - debut != 1:
+            return False
+        if debut <= 1:
+            return False
+        try:
+            _doc_batch(
+                document_id,
+                [
+                    {
+                        "deleteContentRange": {
+                            "range": {"startIndex": debut, "endIndex": fin}
+                        }
+                    }
+                ],
+            )
+        except Exception:
+            return False
+        return True
+    return False
+
+
 def _inserer_tableau(
     document_id: str,
     index: int,
@@ -1255,6 +1440,8 @@ def _inserer_tableau(
 
     _doc_batch(document_id, _styler_tableau(element, avec_entete))
 
+    _supprimer_paragraphe_vide_avant(document_id, index)
+
     document = _doc_get(document_id)
     element = _trouver_tableau(document, index)
     return element["endIndex"] if element else index
@@ -1317,7 +1504,7 @@ def read_document_text(document_id: str) -> Any:
         morceaux = []
         for element in paragraphe.get("elements", []):
             morceaux.append(element.get("textRun", {}).get("content", ""))
-        return "".join(morceaux).rstrip("\n")
+        return "".join(morceaux).replace(DOC_ZWSP, "").rstrip("\n")
 
     def parcourir(elements, dans_tableau=False):
         for element in elements:
@@ -1360,22 +1547,33 @@ def get_document(document_id: str, with_text: bool = True) -> Any:
     document = _doc_get(document_id)
     paragraphes: list = []
 
-    for element in _iter_paragraphs(document):
+    listes_numerotees = _listes_numerotees(document)
+
+    for element, cellule in _iter_paragraphs(document):
         paragraphe = element["paragraph"]
         contenu = "".join(
             sous.get("textRun", {}).get("content", "")
             for sous in paragraphe.get("elements", [])
         )
+        puce = paragraphe.get("bullet")
+        if puce is None:
+            genre_liste = ""
+        elif puce.get("listId") in listes_numerotees:
+            genre_liste = "numero"
+        else:
+            genre_liste = "puce"
         entree = {
             "debut": element.get("startIndex"),
             "fin": element.get("endIndex"),
             "style": paragraphe.get("paragraphStyle", {}).get(
                 "namedStyleType", "NORMAL_TEXT"
             ),
-            "liste": "bullet" in paragraphe,
+            "liste": puce is not None,
+            "genre_liste": genre_liste,
+            "dans_tableau": cellule is not None,
         }
         if with_text:
-            entree["texte"] = contenu.rstrip("\n")
+            entree["texte"] = contenu.replace(DOC_ZWSP, "").rstrip("\n")
         paragraphes.append(entree)
 
     tableaux = []
@@ -1424,10 +1622,18 @@ def create_document(
         corps: dict = {"name": title}
         if folder_id:
             corps["parents"] = [folder_id]
+        # supportsAllDrives est indispensable : le gabarit est dans un Drive
+        # partage. Sans ce parametre, files.copy renvoie 404 sur un fichier
+        # que l'API Docs lit pourtant sans difficulte.
         copie = (
             _drive()
             .files()
-            .copy(fileId=source, body=corps, fields="id,name,webViewLink")
+            .copy(
+                fileId=source,
+                body=corps,
+                fields="id,name,webViewLink",
+                supportsAllDrives=True,
+            )
             .execute()
         )
         return {
@@ -1440,12 +1646,18 @@ def create_document(
     cree = _docs().documents().create(body={"title": title}).execute()
     file_id = cree["documentId"]
     if folder_id:
-        actuel = _drive().files().get(fileId=file_id, fields="parents").execute()
+        actuel = (
+            _drive()
+            .files()
+            .get(fileId=file_id, fields="parents", supportsAllDrives=True)
+            .execute()
+        )
         _drive().files().update(
             fileId=file_id,
             addParents=folder_id,
             removeParents=",".join(actuel.get("parents", [])),
             fields="id,parents",
+            supportsAllDrives=True,
         ).execute()
     return {
         "document_id": file_id,
@@ -1475,6 +1687,15 @@ def clear_document(document_id: str) -> Any:
 
 
 # ------------------------------------------------ outils Docs, écriture
+
+def _appliquer_puces_teal(document_id: str) -> int:
+    """Relit le document et colore le marqueur des listes a puces."""
+    requetes = _requetes_puces_teal(_doc_get(document_id))
+    if not requetes:
+        return 0
+    _doc_batch(document_id, requetes)
+    return len(requetes)
+
 
 @mcp.tool
 @tolerant
@@ -1514,10 +1735,14 @@ def write_markdown(document_id: str, markdown: str, clear_first: bool = True) ->
         return {"erreur": "Aucun contenu à écrire."}
 
     fin = _ecrire_segments(document_id, segments, 1)
+    puces = _appliquer_puces_teal(document_id)
+    if puces:
+        fin = _doc_end_index(_doc_get(document_id))
     return {
         "document_id": document_id,
         "segments_ecrits": len(segments),
         "index_fin": fin,
+        "puces_colorees": puces,
         "url": "https://docs.google.com/document/d/{}/edit".format(document_id),
     }
 
@@ -1532,11 +1757,15 @@ def append_markdown(document_id: str, markdown: str) -> Any:
     document = _doc_get(document_id)
     depart = max(1, _doc_end_index(document) - 1)
     fin = _ecrire_segments(document_id, segments, depart)
+    puces = _appliquer_puces_teal(document_id)
+    if puces:
+        fin = _doc_end_index(_doc_get(document_id))
     return {
         "document_id": document_id,
         "segments_ajoutes": len(segments),
         "index_depart": depart,
         "index_fin": fin,
+        "puces_colorees": puces,
     }
 
 
@@ -1552,6 +1781,13 @@ def replace_text(
 
     Fonctionne aussi dans les en-têtes, les pieds de page et les tableaux,
     ce qui en fait l'outil de choix pour remplir un gabarit à champs.
+
+    Deux limites à connaître. Remplacer par une chaîne vide vide le
+    paragraphe sans le supprimer, il reste un paragraphe blanc. Et lorsque
+    DOC_BULLET_MODE vaut invisible, un caractère de largeur nulle ouvre
+    chaque élément de liste à puces, donc une recherche qui commence au tout
+    premier mot d'un tel élément ne le trouvera pas. Chercher à partir du
+    deuxième mot, ou décaler la recherche d'un mot.
     """
     reponse = (
         _docs()
@@ -1800,7 +2036,9 @@ def apply_house_style_doc(document_id: str, alignment: str = DOC_BODY_ALIGNMENT)
     titres = 0
     paragraphes = 0
 
-    for element in _iter_paragraphs(document):
+    cellules_soutenues = 0
+
+    for element, cellule in _iter_paragraphs(document):
         debut = element.get("startIndex")
         fin = element.get("endIndex")
         if debut is None or fin is None or fin <= debut:
@@ -1810,7 +2048,20 @@ def apply_house_style_doc(document_id: str, alignment: str = DOC_BODY_ALIGNMENT)
         )
         plage = {"startIndex": debut, "endIndex": fin}
 
-        if style_nomme.startswith("HEADING_"):
+        if cellule is not None:
+            # Dans un tableau, c'est le fond de la cellule qui decide, jamais
+            # la position de la ligne. Un fond soutenu impose du texte blanc,
+            # sinon l'en-tete teal devient gris sur teal et ne se lit plus.
+            soutenu = _fond_soutenu(cellule)
+            if soutenu:
+                cellules_soutenues += 1
+            style_p, champs_p = _doc_paragraph_style(alignment="START")
+            style_t, champs_t = _doc_text_style(
+                bold=soutenu,
+                color=COLOR_WHITE if soutenu else COLOR_GREY,
+            )
+            paragraphes += 1
+        elif style_nomme.startswith("HEADING_"):
             try:
                 niveau = int(style_nomme.split("_")[1])
             except (IndexError, ValueError):
@@ -1853,10 +2104,20 @@ def apply_house_style_doc(document_id: str, alignment: str = DOC_BODY_ALIGNMENT)
         return {"erreur": "Document vide, rien à mettre en forme."}
 
     envoyees = _doc_batch(document_id, requetes)
+
+    # Les puces se colorent apres coup, sur un document relu, car la passe
+    # precedente vient de repeindre tout le texte en gris et emporterait le
+    # teal du marqueur.
+    requetes_puces = _requetes_puces_teal(_doc_get(document_id))
+    if requetes_puces:
+        envoyees += _doc_batch(document_id, requetes_puces)
+
     return {
         "requetes_envoyees": envoyees,
         "titres": titres,
         "paragraphes": paragraphes,
+        "cellules_sur_fond_soutenu": cellules_soutenues,
+        "puces_colorees": len(requetes_puces),
     }
 
 
