@@ -732,7 +732,6 @@ DOC_BATCH_SIZE = 150
 
 
 DOC_ZWSP = "\u200b"  # caractere invisible portant la couleur de la puce
-DOC_BULLET_MODE = "invisible"  # "invisible" ou "premier_caractere"
 
 
 def _rgb_from_color(color: dict) -> tuple:
@@ -1152,38 +1151,33 @@ def _listes_numerotees(document: dict) -> set:
     return numerotees
 
 
-def _requetes_puces_teal(document: dict) -> list:
-    """Colore en teal le marqueur des listes a puces.
-
-    L'API Docs ne permet pas de styler un marqueur directement. Le marqueur
-    reprend le style de la premiere portion de texte du paragraphe, ce qui
-    laisse deux voies.
-
-    invisible          un caractere de largeur nulle est place en tete du
-                       paragraphe et colore en teal. Le marqueur devient teal
-                       et le texte visible reste gris, conforme a la charte.
-                       Le caractere est retire par read_document_text, mais il
-                       reste present dans le document, donc une recherche
-                       replace_text portant sur le tout premier mot d'un item
-                       de liste ne le trouvera pas.
-
-    premier_caractere  la premiere lettre visible passe en teal. Aucun
-                       caractere ajoute, mais cette lettre est teal a l'ecran.
-
-    Le mode est fixe par DOC_BULLET_MODE.
-    """
+def _grouper_puces(document: dict) -> list:
+    """Regroupe les paragraphes a puce, non numerotes, contigus dans le texte."""
     numerotees = _listes_numerotees(document)
-    insertions: list = []
-    colorations: list = []
+    groupes: list = []
+    groupe_courant: list = []
+    fin_precedente = None
+
+    def fermer():
+        if groupe_courant:
+            groupes.append(list(groupe_courant))
+            groupe_courant.clear()
 
     for element, _cellule in _iter_paragraphs(document):
         paragraphe = element["paragraph"]
         puce = paragraphe.get("bullet")
-        if puce is None or puce.get("listId") in numerotees:
-            continue
         debut = element.get("startIndex")
         fin = element.get("endIndex")
-        if debut is None or fin is None or fin - 1 <= debut:
+        valide = (
+            puce is not None
+            and puce.get("listId") not in numerotees
+            and debut is not None
+            and fin is not None
+            and fin - 1 > debut
+        )
+        if not valide:
+            fermer()
+            fin_precedente = None
             continue
 
         premier = ""
@@ -1192,13 +1186,38 @@ def _requetes_puces_teal(document: dict) -> list:
             if premier:
                 break
 
-        if DOC_BULLET_MODE == "invisible":
-            if premier.startswith(DOC_ZWSP):
-                colorations.append((debut, debut + 1))
-                continue
-            insertions.append(debut)
+        info = {"debut": debut, "fin": fin, "a_zwsp": premier.startswith(DOC_ZWSP)}
+        if groupe_courant and fin_precedente == debut:
+            groupe_courant.append(info)
         else:
-            colorations.append((debut, debut + 1))
+            fermer()
+            groupe_courant.append(info)
+        fin_precedente = fin
+
+    fermer()
+    return groupes
+
+
+def _requetes_puces_teal(document: dict) -> list:
+    """Colore en teal le marqueur des listes a puces.
+
+    L'API Docs ne permet pas de styler un marqueur directement, et fige sa
+    couleur au moment de createParagraphBullets, a partir du style alors en
+    vigueur sur le premier caractere du paragraphe. Une analyse octet par
+    octet du PDF exporte a confirme qu'une recoloration posterieure du texte
+    ne change rien au marqueur deja cree, meme quand elle porte sur ce meme
+    premier caractere.
+
+    La correction retire donc les puces existantes, colore en teal un
+    caractere de largeur nulle place en tete de chaque paragraphe, puis
+    recree les puces. Le marqueur nait alors directement en teal, le texte
+    visible restant gris. Le caractere est retire par read_document_text,
+    mais il reste present dans le document, donc une recherche replace_text
+    portant sur le tout premier mot d'un item de liste ne le trouvera pas.
+    """
+    groupes = _grouper_puces(document)
+    if not groupes:
+        return []
 
     style, champs = _doc_text_style(color=COLOR_TEAL)
 
@@ -1213,20 +1232,48 @@ def _requetes_puces_teal(document: dict) -> list:
 
     requetes: list = []
 
-    # Les plages deja connues sont traitees en premier, tant que le document
-    # porte encore ses index d'origine.
-    for depart, arrivee in colorations:
-        requetes.append(coloration(depart, arrivee))
+    # Groupes traites du dernier au premier dans le document, pour que les
+    # insertions d'un groupe ne faussent jamais les index de ceux qui le
+    # precedent.
+    for groupe in sorted(groupes, key=lambda g: g[0]["debut"], reverse=True):
+        insertions = 0
+        # A l'interieur d'un groupe, meme logique, du dernier paragraphe
+        # au premier.
+        for info in sorted(groupe, key=lambda i: i["debut"], reverse=True):
+            if info["a_zwsp"]:
+                requetes.append(coloration(info["debut"], info["debut"] + 1))
+            else:
+                requetes.append(
+                    {
+                        "insertText": {
+                            "location": {"index": info["debut"]},
+                            "text": DOC_ZWSP,
+                        }
+                    }
+                )
+                requetes.append(coloration(info["debut"], info["debut"] + 1))
+                insertions += 1
 
-    # Les insertions vont ensuite a rebours, et chaque coloration suit
-    # immediatement son insertion. Grouper toutes les insertions puis toutes
-    # les colorations serait faux, car chaque insertion decale d'une unite
-    # tout ce qui la suit dans le document.
-    for position in sorted(insertions, reverse=True):
+        debut_groupe = groupe[0]["debut"]
+        fin_groupe = groupe[-1]["fin"] + insertions
+
+        # La couleur doit etre en place avant la recreation de la puce,
+        # jamais apres, sans quoi le marqueur repart grise.
         requetes.append(
-            {"insertText": {"location": {"index": position}, "text": DOC_ZWSP}}
+            {
+                "deleteParagraphBullets": {
+                    "range": {"startIndex": debut_groupe, "endIndex": fin_groupe}
+                }
+            }
         )
-        requetes.append(coloration(position, position + 1))
+        requetes.append(
+            {
+                "createParagraphBullets": {
+                    "range": {"startIndex": debut_groupe, "endIndex": fin_groupe},
+                    "bulletPreset": "BULLET_DISC_CIRCLE_SQUARE",
+                }
+            }
+        )
 
     return requetes
 
@@ -1789,9 +1836,9 @@ def replace_text(
     ce qui en fait l'outil de choix pour remplir un gabarit à champs.
 
     Deux limites à connaître. Remplacer par une chaîne vide vide le
-    paragraphe sans le supprimer, il reste un paragraphe blanc. Et lorsque
-    DOC_BULLET_MODE vaut invisible, un caractère de largeur nulle ouvre
-    chaque élément de liste à puces, donc une recherche qui commence au tout
+    paragraphe sans le supprimer, il reste un paragraphe blanc. Et un
+    caractère de largeur nulle ouvre chaque élément de liste à puces, pour
+    porter la couleur du marqueur, donc une recherche qui commence au tout
     premier mot d'un tel élément ne le trouvera pas. Chercher à partir du
     deuxième mot, ou décaler la recherche d'un mot.
     """
