@@ -114,6 +114,16 @@ def tolerant(fn):
     return wrapper
 
 
+def _col_letter(index_1based: int) -> str:
+    """Convertit un index de colonne (1 = A) en lettre(s) de notation A1."""
+    lettres = ""
+    n = index_1based
+    while n > 0:
+        n, reste = divmod(n - 1, 26)
+        lettres = chr(65 + reste) + lettres
+    return lettres
+
+
 def _hex_to_rgb(value: str) -> dict:
     value = value.lstrip("#")
     return {
@@ -222,6 +232,185 @@ def get_values(spreadsheet_id: str, range_a1: str, formulas: bool = False) -> An
         .execute()
     )
     return {"plage": result.get("range"), "valeurs": result.get("values", [])}
+
+
+@mcp.tool
+@tolerant
+def detecter_indices_script(
+    spreadsheet_id: str,
+    max_lignes: int = 50,
+    max_colonnes: int = 30,
+) -> Any:
+    """Outil de TRI HEURISTIQUE pour repérer des scripts Apps Script bound probables.
+
+    ATTENTION — CECI N'EST PAS UNE PREUVE FIABLE. L'API Drive n'expose pas
+    la relation entre un Sheet et son script container-bound (voir la
+    limitation documentée sur find_bound_script). Cet outil ne fait que
+    scanner le contenu d'un classeur à la recherche d'indices INDIRECTS
+    qu'un script y écrit ou le pilote : colonnes de valeurs littérales au
+    milieu de formules, en-têtes à consonance technique, mentions textuelles
+    du mot "script". Un score élevé n'est PAS une confirmation, et un score
+    nul n'est PAS une infirmation. La SEULE méthode fiable à 100% reste
+    l'ouverture manuelle de l'éditeur Apps Script depuis le Sheet
+    (Extensions > Apps Script > icône engrenage > Paramètres du projet >
+    ID du projet Apps Script), puis get_script_content(script_id).
+
+    spreadsheet_id : ID du classeur à scanner.
+    max_lignes     : nombre maximum de lignes lues par onglet (défaut 50).
+    max_colonnes   : nombre maximum de colonnes lues par onglet (défaut 30).
+
+    Retourne un dict par onglet avec les indices détectés et un score
+    qualitatif ("aucun indice", "indice faible", "indice fort") — jamais
+    une affirmation binaire "a un script" / "n'a pas de script".
+    """
+    meta = (
+        _sheets()
+        .spreadsheets()
+        .get(
+            spreadsheetId=spreadsheet_id,
+            fields="properties.title,sheets.properties(sheetId,title,gridProperties)",
+        )
+        .execute()
+    )
+    titre_classeur = meta.get("properties", {}).get("title")
+    resultats = []
+
+    for s in meta.get("sheets", []):
+        props = s["properties"]
+        onglet = props["title"]
+        n_lignes = min(max_lignes, props.get("gridProperties", {}).get("rowCount", max_lignes))
+        n_colonnes = min(max_colonnes, props.get("gridProperties", {}).get("columnCount", max_colonnes))
+        if n_lignes <= 0 or n_colonnes <= 0:
+            resultats.append({
+                "onglet": onglet,
+                "score": "aucun indice",
+                "indices": [],
+                "remarque": "onglet vide ou dimensions nulles",
+            })
+            continue
+
+        derniere_colonne = _col_letter(n_colonnes)
+        range_a1 = f"'{onglet}'!A1:{derniere_colonne}{n_lignes}"
+
+        formules = _sheets().spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=range_a1,
+            valueRenderOption="FORMULA",
+        ).execute().get("values", [])
+        valeurs = _sheets().spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=range_a1,
+            valueRenderOption="UNFORMATTED_VALUE",
+        ).execute().get("values", [])
+
+        indices = []
+
+        # --- Indice 1 : contraste colonnes-formules vs colonnes-valeurs-litterales
+        n_lignes_lues = max(len(formules), len(valeurs))
+        colonnes_formules = set()
+        colonnes_valeurs_litterales = set()
+        for i in range(n_lignes_lues):
+            ligne_f = formules[i] if i < len(formules) else []
+            ligne_v = valeurs[i] if i < len(valeurs) else []
+            for c in range(n_colonnes):
+                f = ligne_f[c] if c < len(ligne_f) else ""
+                v = ligne_v[c] if c < len(ligne_v) else ""
+                if f == "" and v == "":
+                    continue
+                est_formule = isinstance(f, str) and f.startswith("=")
+                if est_formule:
+                    colonnes_formules.add(c)
+                elif f == v:
+                    # même contenu en mode FORMULA et en mode valeur calculée
+                    # => ce n'est pas une formule, c'est une valeur littérale
+                    colonnes_valeurs_litterales.add(c)
+
+        if colonnes_formules:
+            seuil = 5
+            colonnes_suspectes = []
+            for c in colonnes_valeurs_litterales:
+                nb_non_vides = sum(
+                    1
+                    for i in range(n_lignes_lues)
+                    if c < len(valeurs[i] if i < len(valeurs) else [])
+                    and (valeurs[i][c] if c < len(valeurs[i]) else "") not in ("", None)
+                )
+                if nb_non_vides >= seuil:
+                    colonnes_suspectes.append({"colonne": _col_letter(c + 1), "cellules_non_vides": nb_non_vides})
+            if colonnes_suspectes:
+                indices.append({
+                    "type": "colonnes_valeurs_litterales_parmi_formules",
+                    "detail": (
+                        "Colonnes remplies de valeurs littérales identiques en mode "
+                        "FORMULA et en mode valeur calculée, alors que d'autres "
+                        "colonnes du même onglet contiennent des formules."
+                    ),
+                    "colonnes": colonnes_suspectes,
+                })
+
+        # --- Indice 2 : en-têtes à consonance technique/programmatique
+        premiere_ligne_non_vide = next((ligne for ligne in valeurs if any(str(x).strip() for x in ligne)), [])
+        entetes_suspects = []
+        for c, cellule in enumerate(premiere_ligne_non_vide):
+            texte = str(cellule).strip() if cellule is not None else ""
+            if not texte:
+                continue
+            if texte.startswith("__") or "__" in texte:
+                entetes_suspects.append({"colonne": _col_letter(c + 1), "entete": texte})
+        if entetes_suspects:
+            indices.append({
+                "type": "entetes_techniques",
+                "detail": "En-têtes contenant un double underscore ou commençant par '__'.",
+                "entetes": entetes_suspects,
+            })
+
+        # --- Indice 3 : mention textuelle "le script" et variantes
+        motifs = ("le script", "ce script", "script apps script")
+        mentions = []
+        for i, ligne in enumerate(valeurs):
+            for c, cellule in enumerate(ligne):
+                if not isinstance(cellule, str):
+                    continue
+                bas = cellule.lower()
+                for motif in motifs:
+                    if motif in bas:
+                        mentions.append({
+                            "cellule": f"{_col_letter(c + 1)}{i + 1}",
+                            "extrait": cellule[:200],
+                        })
+                        break
+        if mentions:
+            indices.append({
+                "type": "mention_textuelle_script",
+                "detail": "Texte mentionnant explicitement un script (\"le script\", \"ce script\"...).",
+                "mentions": mentions,
+            })
+
+        # --- Score qualitatif global (heuristique, pas une preuve)
+        if not indices:
+            score = "aucun indice"
+        elif len(indices) == 1:
+            score = "indice faible"
+        else:
+            score = "indice fort"
+
+        resultats.append({
+            "onglet": onglet,
+            "score": score,
+            "indices": indices,
+        })
+
+    return {
+        "classeur": titre_classeur,
+        "spreadsheet_id": spreadsheet_id,
+        "avertissement": (
+            "Résultat purement indicatif. Ce n'est PAS une preuve de présence "
+            "ou d'absence de script bound. La seule méthode fiable à 100% est "
+            "l'ouverture manuelle de l'éditeur Apps Script depuis le Sheet "
+            "(Extensions > Apps Script) et la communication de l'ID du projet."
+        ),
+        "onglets": resultats,
+    }
 
 
 # ---------------------------------------------------------------- écriture
