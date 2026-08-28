@@ -2218,6 +2218,50 @@ def list_script_projects(name: str = "", limit: int = 20) -> Any:
 
 @mcp.tool
 @tolerant
+def find_bound_script(file_id: str) -> Any:
+    """Cherche un script Apps Script lié (container-bound) à un fichier Drive.
+
+    file_id : ID du Google Sheets/Docs/Forms dont on cherche le script associé.
+
+    Retourne la liste des projets Apps Script trouvés comme "enfants" de ce
+    fichier dans Drive. Une liste vide ne prouve PAS l'absence de script :
+    les scripts bound créés avant ~2020 n'ont souvent aucune trace Drive
+    distincte et n'apparaissent jamais dans Drive.files.list, même avec ce
+    filtre par parent. Dans ce cas, récupérer l'ID du projet manuellement
+    depuis l'éditeur Apps Script (Extensions > Apps Script > icône
+    engrenage > Paramètres du projet > ID du projet Apps Script).
+    """
+    query = (
+        "'{}' in parents and mimeType='application/vnd.google-apps.script' "
+        "and trashed=false"
+    ).format(file_id.replace("'", "\\'"))
+    result = (
+        _drive()
+        .files()
+        .list(
+            q=query,
+            pageSize=10,
+            fields="files(id,name,modifiedTime,parents)",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        )
+        .execute()
+    )
+    fichiers = result.get("files", [])
+    return {
+        "file_id_recherche": file_id,
+        "scripts_trouves": fichiers,
+        "note": (
+            "Liste vide = soit aucun script bound, soit un script bound "
+            "ancien (pré-2020) sans trace Drive distincte. Dans ce dernier "
+            "cas, seule la récupération manuelle de l'ID depuis l'éditeur "
+            "Apps Script (Paramètres du projet) fonctionne."
+        ),
+    }
+
+
+@mcp.tool
+@tolerant
 def create_script_project(title: str, parent_id: str = "") -> Any:
     """Crée un projet Apps Script.
 
