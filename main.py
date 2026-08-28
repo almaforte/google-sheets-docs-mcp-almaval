@@ -2278,6 +2278,72 @@ def find_bound_script(file_id: str) -> Any:
 
 @mcp.tool
 @tolerant
+def rename_drive_file(file_id: str, new_name: str) -> Any:
+    """Renomme un fichier ou un dossier Google Drive.
+
+    file_id  : identifiant Drive du fichier ou du dossier à renommer
+    new_name : nouveau nom à appliquer
+
+    Fonctionne pour tout objet Drive (classeur, document, dossier, projet
+    Apps Script...), le renommage passant toujours par l'API Drive, quel
+    que soit le type du fichier.
+    """
+    updated = (
+        _drive()
+        .files()
+        .update(
+            fileId=file_id,
+            body={"name": new_name},
+            fields="id,name",
+            supportsAllDrives=True,
+        )
+        .execute()
+    )
+    return {
+        "file_id": updated.get("id"),
+        "nouveau_nom": updated.get("name"),
+    }
+
+
+@mcp.tool
+@tolerant
+def rename_script_project(script_id: str, new_name: str) -> Any:
+    """Renomme un projet Apps Script autonome.
+
+    script_id : identifiant du projet Apps Script (= son fileId Drive)
+    new_name  : nouveau nom du projet
+
+    L'API Apps Script (script.googleapis.com) n'expose aucun endpoint de
+    renommage de projet. Un projet Apps Script autonome est en réalité un
+    fichier Google Drive de type 'application/vnd.google-apps.script', et
+    son script_id est identique à son fileId Drive : le renommage passe
+    donc par l'API Drive (files().update), au même titre que
+    rename_drive_file, et non par le client _script() (jeton utilisateur).
+
+    Ne fonctionne que pour un projet autonome. Un script container-bound
+    (lié à un classeur ou un document) n'a pas de nom propre dans Drive :
+    c'est le nom du fichier conteneur qui prévaut, à renommer via
+    rename_drive_file sur son propre file_id.
+    """
+    updated = (
+        _drive()
+        .files()
+        .update(
+            fileId=script_id,
+            body={"name": new_name},
+            fields="id,name",
+            supportsAllDrives=True,
+        )
+        .execute()
+    )
+    return {
+        "script_id": updated.get("id"),
+        "nouveau_nom": updated.get("name"),
+    }
+
+
+@mcp.tool
+@tolerant
 def create_script_project(title: str, parent_id: str = "") -> Any:
     """Crée un projet Apps Script.
 
