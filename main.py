@@ -2344,6 +2344,84 @@ def rename_script_project(script_id: str, new_name: str) -> Any:
 
 @mcp.tool
 @tolerant
+def get_file_metadata(file_id: str) -> Any:
+    """Retourne les métadonnées d'un fichier ou dossier Google Drive.
+
+    file_id : identifiant Drive du fichier ou du dossier
+
+    Utile notamment pour déterminer le type réel d'un fichier (mimeType)
+    avant de choisir le bon outil pour le lire (get_spreadsheet,
+    read_document_text, get_script_content, list_folder...), ou pour savoir
+    si un ID donné est en fait un dossier.
+    """
+    meta = (
+        _drive()
+        .files()
+        .get(
+            fileId=file_id,
+            fields="id,name,mimeType,parents,webViewLink,modifiedTime,size,trashed",
+            supportsAllDrives=True,
+        )
+        .execute()
+    )
+    return {
+        "id": meta.get("id"),
+        "nom": meta.get("name"),
+        "type_mime": meta.get("mimeType"),
+        "parents": meta.get("parents", []),
+        "url": meta.get("webViewLink"),
+        "modifie_le": meta.get("modifiedTime"),
+        "taille": meta.get("size"),
+        "corbeille": meta.get("trashed", False),
+    }
+
+
+@mcp.tool
+@tolerant
+def list_folder(folder_id: str, limit: int = 100) -> Any:
+    """Liste le contenu direct (non récursif) d'un dossier Google Drive.
+
+    folder_id : identifiant Drive du dossier
+    limit     : nombre maximum de fichiers/dossiers retournés
+
+    Retourne, pour chaque élément : id, nom, type mime (permettant de
+    distinguer un sous-dossier d'un fichier, et le type de fichier),
+    date de dernière modification et lien de visualisation. Les éléments
+    mis à la corbeille ne sont pas inclus.
+    """
+    result = (
+        _drive()
+        .files()
+        .list(
+            q="'{}' in parents and trashed=false".format(folder_id.replace("'", "\\'")),
+            pageSize=limit,
+            orderBy="folder,name",
+            fields="files(id,name,mimeType,modifiedTime,webViewLink)",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        )
+        .execute()
+    )
+    fichiers = result.get("files", [])
+    return {
+        "folder_id": folder_id,
+        "nombre_elements": len(fichiers),
+        "elements": [
+            {
+                "id": f.get("id"),
+                "nom": f.get("name"),
+                "type_mime": f.get("mimeType"),
+                "est_dossier": f.get("mimeType") == "application/vnd.google-apps.folder",
+                "modifie_le": f.get("modifiedTime"),
+                "url": f.get("webViewLink"),
+            }
+            for f in fichiers
+        ],
+    }
+
+
+@mcp.tool
+@tolerant
 def create_script_project(title: str, parent_id: str = "") -> Any:
     """Crée un projet Apps Script.
 
