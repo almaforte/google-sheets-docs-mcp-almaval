@@ -2223,13 +2223,25 @@ def find_bound_script(file_id: str) -> Any:
 
     file_id : ID du Google Sheets/Docs/Forms dont on cherche le script associé.
 
-    Retourne la liste des projets Apps Script trouvés comme "enfants" de ce
-    fichier dans Drive. Une liste vide ne prouve PAS l'absence de script :
-    les scripts bound créés avant ~2020 n'ont souvent aucune trace Drive
-    distincte et n'apparaissent jamais dans Drive.files.list, même avec ce
-    filtre par parent. Dans ce cas, récupérer l'ID du projet manuellement
-    depuis l'éditeur Apps Script (Extensions > Apps Script > icône
-    engrenage > Paramètres du projet > ID du projet Apps Script).
+    LIMITATION CONFIRMÉE (test du 28.08.2026) : Google n'expose pas la relation
+    container -> script bound via Drive.files.list, quel que soit l'âge du
+    script. Vérifié empiriquement sur "Almaval - Patients" / script "Almaval -
+    Gestion des Admissions" (créé en 2023, donc pas un cas "ancien") : le
+    fichier script Drive n'a AUCUN champ parents renseigné, alors que le
+    fichier conteneur en a un. Ce n'est pas un bug de ce connecteur ni un
+    problème de Drive partagé / paramètre corpora : Google ne matérialise
+    tout simplement pas ce lien dans le graphe parent/enfant de Drive, pour
+    aucune API publique (Drive, Sheets, Apps Script).
+
+    Cette fonction reste disponible à titre indicatif (elle peut
+    ponctuellement trouver un résultat), mais une liste vide n'est PAS un
+    indice fiable d'absence de script bound — ne pas la considérer comme
+    un test d'exhaustivité.
+
+    Méthode fiable à 100% : récupérer l'ID du projet manuellement depuis
+    l'éditeur Apps Script (Extensions > Apps Script > icône engrenage >
+    Paramètres du projet > ID du projet Apps Script), puis utiliser
+    get_script_content(script_id).
     """
     query = (
         "'{}' in parents and mimeType='application/vnd.google-apps.script' "
@@ -2252,10 +2264,14 @@ def find_bound_script(file_id: str) -> Any:
         "file_id_recherche": file_id,
         "scripts_trouves": fichiers,
         "note": (
-            "Liste vide = soit aucun script bound, soit un script bound "
-            "ancien (pré-2020) sans trace Drive distincte. Dans ce dernier "
-            "cas, seule la récupération manuelle de l'ID depuis l'éditeur "
-            "Apps Script (Paramètres du projet) fonctionne."
+            "Limitation confirmée de l'API Drive (pas un bug de ce "
+            "connecteur) : la relation container -> script bound n'est pas "
+            "exposée par Drive.files.list, indépendamment de l'âge du "
+            "script (vérifié sur un script créé en 2023, le 28.08.2026). "
+            "Liste vide = aucun indice fiable, ni dans un sens ni dans "
+            "l'autre. Seule la récupération manuelle de l'ID depuis "
+            "l'éditeur Apps Script (Paramètres du projet) fonctionne de "
+            "façon fiable."
         ),
     }
 
