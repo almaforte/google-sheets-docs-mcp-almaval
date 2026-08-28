@@ -240,6 +240,7 @@ def detecter_indices_script(
     spreadsheet_id: str,
     max_lignes: int = 50,
     max_colonnes: int = 30,
+    max_onglets: int = 15,
 ) -> Any:
     """Outil de TRI HEURISTIQUE pour repérer des scripts Apps Script bound probables.
 
@@ -258,6 +259,23 @@ def detecter_indices_script(
     spreadsheet_id : ID du classeur à scanner.
     max_lignes     : nombre maximum de lignes lues par onglet (défaut 50).
     max_colonnes   : nombre maximum de colonnes lues par onglet (défaut 30).
+    max_onglets    : nombre maximum d'onglets scannés (défaut 15). Si le
+                     classeur en contient davantage, les onglets excédentaires
+                     sont ignorés et signalés dans le champ "onglets_ignores"
+                     du résultat, pour éviter qu'un classeur à très grand
+                     nombre d'onglets ne génère un volume d'appels excessif.
+
+    Consommation API : cet outil ne fait jamais plus de 3 appels à l'API
+    Sheets au total pour tout le classeur, quel que soit le nombre d'onglets
+    scannés — un appel spreadsheets().get() pour lister les onglets, puis
+    un seul spreadsheets().values().batchGet() en mode FORMULA regroupant
+    les plages de tous les onglets scannés, et un seul batchGet() en mode
+    valeur calculée (UNFORMATTED_VALUE).
+
+    Si l'outil échoue avec une erreur de quota (HTTP 429, "Quota exceeded"),
+    il s'agit très probablement d'appels concurrents provenant d'ailleurs
+    (autres outils, exécutions en parallèle) plutôt que de cet outil
+    lui-même : patientez 60 à 90 secondes puis réessayez.
 
     Retourne un dict par onglet avec les indices détectés et un score
     qualitatif ("aucun indice", "indice faible", "indice fort") — jamais
@@ -275,7 +293,13 @@ def detecter_indices_script(
     titre_classeur = meta.get("properties", {}).get("title")
     resultats = []
 
-    for s in meta.get("sheets", []):
+    tous_onglets = meta.get("sheets", [])
+    onglets_a_scanner = tous_onglets[:max_onglets]
+    onglets_ignores = [s["properties"]["title"] for s in tous_onglets[max_onglets:]]
+
+    # --- Préparation des plages à scanner, une passe (pas d'appel réseau ici)
+    plan = []  # liste de dicts : onglet, range_a1, n_lignes, n_colonnes
+    for s in onglets_a_scanner:
         props = s["properties"]
         onglet = props["title"]
         n_lignes = min(max_lignes, props.get("gridProperties", {}).get("rowCount", max_lignes))
@@ -288,20 +312,52 @@ def detecter_indices_script(
                 "remarque": "onglet vide ou dimensions nulles",
             })
             continue
-
         derniere_colonne = _col_letter(n_colonnes)
         range_a1 = f"'{onglet}'!A1:{derniere_colonne}{n_lignes}"
+        plan.append({
+            "onglet": onglet,
+            "range_a1": range_a1,
+            "n_lignes": n_lignes,
+            "n_colonnes": n_colonnes,
+        })
 
-        formules = _sheets().spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id,
-            range=range_a1,
-            valueRenderOption="FORMULA",
-        ).execute().get("values", [])
-        valeurs = _sheets().spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id,
-            range=range_a1,
-            valueRenderOption="UNFORMATTED_VALUE",
-        ).execute().get("values", [])
+    # --- Un seul batchGet par mode pour TOUT le classeur (2 appels au total)
+    formules_par_onglet = {}
+    valeurs_par_onglet = {}
+    if plan:
+        ranges = [p["range_a1"] for p in plan]
+        reponse_formules = (
+            _sheets()
+            .spreadsheets()
+            .values()
+            .batchGet(
+                spreadsheetId=spreadsheet_id,
+                ranges=ranges,
+                valueRenderOption="FORMULA",
+            )
+            .execute()
+        )
+        reponse_valeurs = (
+            _sheets()
+            .spreadsheets()
+            .values()
+            .batchGet(
+                spreadsheetId=spreadsheet_id,
+                ranges=ranges,
+                valueRenderOption="UNFORMATTED_VALUE",
+            )
+            .execute()
+        )
+        for p, vr in zip(plan, reponse_formules.get("valueRanges", [])):
+            formules_par_onglet[p["onglet"]] = vr.get("values", [])
+        for p, vr in zip(plan, reponse_valeurs.get("valueRanges", [])):
+            valeurs_par_onglet[p["onglet"]] = vr.get("values", [])
+
+    for p in plan:
+        onglet = p["onglet"]
+        n_colonnes = p["n_colonnes"]
+        formules = formules_par_onglet.get(onglet, [])
+        valeurs = valeurs_par_onglet.get(onglet, [])
 
         indices = []
 
@@ -400,7 +456,7 @@ def detecter_indices_script(
             "indices": indices,
         })
 
-    return {
+    reponse = {
         "classeur": titre_classeur,
         "spreadsheet_id": spreadsheet_id,
         "avertissement": (
@@ -411,6 +467,15 @@ def detecter_indices_script(
         ),
         "onglets": resultats,
     }
+    if onglets_ignores:
+        reponse["onglets_ignores"] = onglets_ignores
+        reponse["remarque_onglets_ignores"] = (
+            f"Le classeur contient plus de {max_onglets} onglets ; seuls les "
+            f"{max_onglets} premiers ont été scannés pour limiter la "
+            "consommation de quota API. Augmentez max_onglets pour scanner "
+            "les autres."
+        )
+    return reponse
 
 
 # ---------------------------------------------------------------- écriture
