@@ -2595,6 +2595,91 @@ def list_deployments(script_id: str) -> Any:
     return sorties
 
 
+def _web_app_url(script_id: str) -> str:
+    """Obtient une URL de web app utilisable pour un projet Apps Script.
+
+    Réutilise en priorité un déploiement existant portant une URL
+    exploitable (via list_deployments) ; à défaut, en crée un nouveau
+    avec deploy_web_app. Fonction interne, non exposée comme outil MCP.
+    """
+    deploiements = list_deployments(script_id)
+    if isinstance(deploiements, list):
+        for dep in deploiements:
+            url = dep.get("url")
+            if url:
+                return url
+    nouveau = deploy_web_app(script_id, description="Déploiement automatique - gestion des déclencheurs")
+    return nouveau.get("url", "")
+
+
+@mcp.tool
+@tolerant
+def list_triggers(script_id: str) -> Any:
+    """Liste les déclencheurs (triggers) installés sur un projet Apps Script.
+
+    script_id : identifiant du projet Apps Script (= son fileId Drive)
+
+    Réutilise un déploiement web app existant si disponible, sinon en
+    crée un nouveau (voir deploy_web_app). Envoie ensuite l'action
+    « listTriggers » à ce déploiement via run_web_app.
+
+    Nécessite que le projet cible contienne le fichier
+    98_admin_declencheurs avec son doPost, et que la variable
+    d'environnement SCRIPT_SHARED_SECRET du serveur corresponde à la
+    Script Property ADMIN_SHARED_SECRET du projet cible. Sans quoi
+    l'appel échoue ou retourne une erreur renvoyée par le script cible
+    (secret invalide, action inconnue, etc.).
+    """
+    url = _web_app_url(script_id)
+    if not url:
+        return {"erreur": "Impossible d'obtenir une URL de web app pour ce script_id."}
+    resultat = run_web_app(url, payload={"action": "listTriggers"})
+    if not isinstance(resultat, dict) or resultat.get("statut") != 200:
+        return {"erreur": "Échec de l'appel au projet cible.", "detail": resultat}
+    reponse = resultat.get("reponse")
+    if isinstance(reponse, dict) and "erreur" in reponse:
+        return {"erreur": reponse["erreur"]}
+    if isinstance(reponse, dict) and "declencheurs" in reponse:
+        return reponse
+    return resultat
+
+
+@mcp.tool
+@tolerant
+def delete_trigger(script_id: str, handler_function: str) -> Any:
+    """Supprime le ou les déclencheurs associés à une fonction donnée.
+
+    script_id        : identifiant du projet Apps Script (= son fileId Drive)
+    handler_function : nom de la fonction dont il faut supprimer les
+        déclencheurs (par ex. "surModification")
+
+    Réutilise un déploiement web app existant si disponible, sinon en
+    crée un nouveau (voir deploy_web_app). Envoie ensuite l'action
+    « deleteTrigger » à ce déploiement via run_web_app.
+
+    Nécessite que le projet cible contienne le fichier
+    98_admin_declencheurs avec son doPost, et que la variable
+    d'environnement SCRIPT_SHARED_SECRET du serveur corresponde à la
+    Script Property ADMIN_SHARED_SECRET du projet cible. Sans quoi
+    l'appel échoue ou retourne une erreur renvoyée par le script cible
+    (secret invalide, action inconnue, etc.).
+    """
+    url = _web_app_url(script_id)
+    if not url:
+        return {"erreur": "Impossible d'obtenir une URL de web app pour ce script_id."}
+    resultat = run_web_app(
+        url, payload={"action": "deleteTrigger", "fonction": handler_function}
+    )
+    if not isinstance(resultat, dict) or resultat.get("statut") != 200:
+        return {"erreur": "Échec de l'appel au projet cible.", "detail": resultat}
+    reponse = resultat.get("reponse")
+    if isinstance(reponse, dict) and "erreur" in reponse:
+        return {"erreur": reponse["erreur"]}
+    if isinstance(reponse, dict) and "supprimes" in reponse:
+        return reponse
+    return resultat
+
+
 @mcp.tool
 @tolerant
 def run_web_app(url: str, payload: Optional[dict] = None, timeout: int = 120) -> Any:
