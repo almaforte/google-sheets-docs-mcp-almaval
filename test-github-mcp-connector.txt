@@ -1,2 +1,0 @@
-Test du connecteur github-mcp — écriture directe via l'API GitHub, sans git push local.
-Ce fichier peut être supprimé sans conséquence.
