@@ -2849,6 +2849,115 @@ def list_deployments(script_id: str) -> Any:
     return sorties
 
 
+@mcp.tool
+@tolerant
+def delete_deployment(script_id: str, deployment_id: str) -> Any:
+    """Supprime (archive) un déploiement précis d'un projet Apps Script.
+
+    Un déploiement "archivé" depuis l'éditeur Google correspond, côté API,
+    à une suppression : il n'existe pas d'état "archivé" distinct de
+    "supprimé". Le déploiement disparaît de la liste et libère un
+    emplacement sur le plafond de 20 déploiements versionnés par projet.
+
+    Ne jamais supprimer le déploiement le plus récent (le seul dont l'URL
+    est en cours d'utilisation) sans s'en être assuré au préalable via
+    list_deployments -- cet outil ne fait aucune vérification de ce type,
+    il exécute la suppression demandée telle quelle.
+    """
+    _script().projects().deployments().delete(
+        scriptId=script_id, deploymentId=deployment_id
+    ).execute()
+    return {"script_id": script_id, "deployment_id": deployment_id, "supprime": True}
+
+
+@mcp.tool
+@tolerant
+def archive_old_deployments(
+    script_id: str, garder: int = 5, seuil: int = 15
+) -> Any:
+    """Archive automatiquement les déploiements les plus anciens d'un projet.
+
+    Empêche de heurter le plafond de 20 déploiements versionnés par projet
+    Apps Script, qui bloque tout futur deploy_web_app avec une erreur HTTP
+    400 tant qu'aucun ancien déploiement n'est libéré. Avant cet outil, ce
+    nettoyage exigeait une intervention manuelle dans l'éditeur Google
+    (Déployer > Gérer les déploiements > archiver) à chaque fois que le
+    plafond était atteint.
+
+    garder : nombre de déploiements les plus récents à conserver intacts
+        (défaut 5) -- couvre largement un besoin ponctuel de retour en
+        arrière sans jamais laisser le compteur s'approcher de 20.
+    seuil : n'archive que si le nombre total de déploiements atteint ou
+        dépasse ce seuil (défaut 15) -- évite d'archiver inutilement un
+        projet encore loin du plafond.
+
+    Tri par ordre chronologique croissant sur la date de dernière
+    modification (updateTime) quand elle est disponible ; à défaut, sur le
+    numéro de version (deploymentConfig.versionNumber), qui croît de façon
+    monotone à chaque nouveau déploiement. Le déploiement de version la
+    plus élevée n'est jamais archivé, même par accident de tri.
+
+    Usage recommandé : appeler cet outil juste avant deploy_web_app sur
+    tout projet dont l'historique de déploiements s'allonge, pour ne
+    jamais heurter le plafond -- inutile d'attendre l'erreur HTTP 400 pour
+    y penser.
+    """
+    resultat = list_deployments(script_id)
+    if isinstance(resultat, dict) and resultat.get("erreur"):
+        return resultat
+    deploiements_bruts = (
+        _script().projects().deployments().list(scriptId=script_id).execute()
+    ).get("deployments", [])
+
+    total = len(deploiements_bruts)
+    if total < seuil:
+        return {
+            "ok": True,
+            "action": "aucune",
+            "message": f"total actuel ({total}) sous le seuil ({seuil}), rien à archiver",
+            "total_avant": total,
+        }
+
+    def version_de(dep: dict) -> int:
+        return dep.get("deploymentConfig", {}).get("versionNumber") or 0
+
+    def cle_tri(dep: dict):
+        maj = dep.get("updateTime")
+        if maj:
+            return (0, maj)
+        return (1, version_de(dep))
+
+    deploiements_tries = sorted(deploiements_bruts, key=cle_tri)
+    version_max = max((version_de(d) for d in deploiements_bruts), default=0)
+
+    a_archiver = [
+        d
+        for d in deploiements_tries[: max(total - garder, 0)]
+        if version_de(d) != version_max or version_max == 0
+    ]
+
+    reussis, echecs = [], []
+    for dep in a_archiver:
+        deployment_id = dep.get("deploymentId")
+        try:
+            _script().projects().deployments().delete(
+                scriptId=script_id, deploymentId=deployment_id
+            ).execute()
+            reussis.append(deployment_id)
+        except HttpError as exc:
+            echecs.append({"deployment_id": deployment_id, "erreur": exc._get_reason()})
+
+    return {
+        "ok": True,
+        "action": "archivage",
+        "total_avant": total,
+        "archives_avec_succes": len(reussis),
+        "deployment_ids_archives": reussis,
+        "echecs": echecs,
+        "total_apres": total - len(reussis),
+    }
+
+
 def _web_app_url(script_id: str) -> str:
     """Obtient une URL de web app utilisable pour un projet Apps Script.
 
