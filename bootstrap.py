@@ -2,16 +2,20 @@
 
 Pourquoi ce fichier plutôt qu'une modification de main.py
 
-main.py fait plus de cent kilo-octets. Le connecteur GitHub n'écrit que
-des fichiers entiers : le réémettre pour ajouter trente lignes frôle la
-limite de sortie du modèle, et une troncature silencieuse corromprait le
-serveur. Ce fichier contourne l'obstacle sans rien réécrire : il importe
-main, qui enregistre ses quarante-neuf outils au passage, ajoute les
-siens sur le même serveur, puis reconstruit l'application ASGI avec le
-même chemin et le même contrôle de clé.
+main.py fait plus de cent kilo-octets. L'outil d'écriture dont dispose
+Claude ne remplace que des fichiers entiers : le réémettre pour ajouter
+trente lignes frôle la limite de sortie et risque une troncature
+silencieuse. Ce fichier contourne l'obstacle sans rien réécrire : il
+importe main, qui enregistre ses outils au passage, ajoute les siens sur
+le même serveur, puis reconstruit l'application ASGI avec le même chemin
+et le même contrôle de clé.
 
-main.py n'est pas modifié d'une ligne. Seul le Procfile change, pour
-démarrer ici plutôt que là.
+main.py n'est pas modifié d'une ligne.
+
+Attention : la commande de démarrage vit dans les réglages Railway, pas
+dans le Procfile, et elle l'emporte sur lui. Elle doit valoir
+« python bootstrap.py », sans quoi ce fichier n'est jamais exécuté et
+rien ne le signale.
 """
 
 import os
@@ -23,7 +27,7 @@ import main
 from main import ApiKeyMiddleware, mcp, tolerant, _script
 
 
-@mcp.tool
+@mcp.tool()
 @tolerant
 def update_web_app_deployment(
     script_id: str,
@@ -84,7 +88,7 @@ def update_web_app_deployment(
     }
 
 
-@mcp.tool
+@mcp.tool()
 @tolerant
 def identite_du_serveur():
     """Dit sous quel compte Google ce serveur travaille réellement.
@@ -116,6 +120,22 @@ def identite_du_serveur():
 app = mcp.http_app(
     path=os.environ.get("MCP_PATH", "/mcp"),
     middleware=[Middleware(ApiKeyMiddleware)],
+)
+
+
+# Trace de démarrage. main.py et bootstrap.py produisent les mêmes
+# journaux uvicorn : sans cette ligne, rien ne dit lequel tourne.
+try:
+    import fastmcp as _fastmcp
+
+    _version = getattr(_fastmcp, "__version__", "inconnue")
+except Exception:  # noqa: BLE001
+    _version = "inconnue"
+
+print(
+    "[bootstrap] point d'entrée actif, fastmcp " + str(_version) +
+    ", outils supplémentaires : update_web_app_deployment, identite_du_serveur",
+    flush=True,
 )
 
 
