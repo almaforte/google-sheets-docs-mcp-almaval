@@ -117,6 +117,133 @@ def identite_du_serveur():
     return rapport
 
 
+@mcp.tool()
+@tolerant
+def move_file_to_folder(file_id: str, target_folder_id: str):
+    """Déplace un fichier OU un dossier Drive vers un autre dossier.
+
+    file_id          : identifiant Drive de l'élément à déplacer
+    target_folder_id : identifiant Drive du dossier de destination
+
+    Ajouté le 03.09.2026. Root cause identifiée ce jour-là : le
+    connecteur Drive générique de Cowork échouait systématiquement en
+    erreur de permission sur tout déplacement traversant la frontière
+    d'un Drive partagé (ici « 1a Employés & collaborateurs - Almaval »),
+    alors même que le compte impersonné (IMPERSONATE_USER) est confirmé
+    organisateur sur les dossiers source ET cible. Ce serveur pose déjà
+    supportsAllDrives=True sur tous ses appels Drive (voir
+    create_spreadsheet, rename_drive_file, get_file_metadata...) ; ce
+    même paramètre, vraisemblablement absent côté connecteur générique,
+    suffit à lever le blocage ici.
+
+    Retire TOUS les parents actuels avant d'ajouter le nouveau, pas
+    seulement le premier : un fichier avec plusieurs parents (rare mais
+    possible dans un Drive partagé) se retrouve donc avec exactement un
+    seul parent après l'appel, le dossier cible. Idempotent dans son
+    effet si rappelé avec la même cible (le fichier y est déjà, l'appel
+    ne fait que confirmer son état).
+    """
+    actuel = (
+        main._drive()
+        .files()
+        .get(fileId=file_id, fields="parents,name", supportsAllDrives=True)
+        .execute()
+    )
+    anciens_parents = actuel.get("parents", [])
+    deplace = (
+        main._drive()
+        .files()
+        .update(
+            fileId=file_id,
+            addParents=target_folder_id,
+            removeParents=",".join(anciens_parents),
+            fields="id,name,parents,webViewLink",
+            supportsAllDrives=True,
+        )
+        .execute()
+    )
+    return {
+        "id": deplace.get("id"),
+        "nom": deplace.get("name"),
+        "parents": deplace.get("parents", []),
+        "anciens_parents": anciens_parents,
+        "url": deplace.get("webViewLink"),
+    }
+
+
+@mcp.tool()
+@tolerant
+def copy_file_to_folder(file_id: str, target_folder_id: str, new_name: str = ""):
+    """Copie un fichier Drive dans un dossier, avec son contenu réel.
+
+    file_id          : identifiant Drive du fichier à copier (un dossier
+                        ne peut pas être copié récursivement par l'API
+                        Drive ; ne fonctionne que sur un fichier)
+    target_folder_id : dossier de destination pour la copie
+    new_name         : nom de la copie ; nom d'origine conservé si omis
+
+    Ajouté le 03.09.2026, même cause que move_file_to_folder : un essai
+    via le connecteur Drive générique de Cowork avait produit un fichier
+    corrompu de 1 octet au lieu d'une vraie copie, en traversant la même
+    frontière de Drive partagé (supportsAllDrives vraisemblablement
+    absent côté connecteur). Ce paramètre est posé ici, comme partout
+    ailleurs dans ce serveur.
+    """
+    corps: dict = {"parents": [target_folder_id]}
+    if new_name:
+        corps["name"] = new_name
+    copie = (
+        main._drive()
+        .files()
+        .copy(
+            fileId=file_id,
+            body=corps,
+            fields="id,name,parents,webViewLink",
+            supportsAllDrives=True,
+        )
+        .execute()
+    )
+    return {
+        "id": copie.get("id"),
+        "nom": copie.get("name"),
+        "parents": copie.get("parents", []),
+        "url": copie.get("webViewLink"),
+    }
+
+
+@mcp.tool()
+@tolerant
+def trash_drive_file(file_id: str):
+    """Met un fichier ou dossier Drive à la corbeille (récupérable ~30 jours).
+
+    file_id : identifiant Drive de l'élément à mettre à la corbeille
+
+    Idempotent : si l'élément est déjà à la corbeille, l'appel renvoie
+    son état actuel sans erreur plutôt que d'échouer. Ajouté le
+    03.09.2026 en même temps que move_file_to_folder et
+    copy_file_to_folder, pour couvrir le cas d'un doublon orphelin qu'il
+    vaut mieux supprimer que déplacer (ex. Pannatier Virginie, migration
+    « 1a », 03.09.2026 : deux copies vierges identiques, l'orpheline
+    mise à la corbeille plutôt que déplacée à côté de la bonne).
+    """
+    mis_a_jour = (
+        main._drive()
+        .files()
+        .update(
+            fileId=file_id,
+            body={"trashed": True},
+            fields="id,name,trashed",
+            supportsAllDrives=True,
+        )
+        .execute()
+    )
+    return {
+        "id": mis_a_jour.get("id"),
+        "nom": mis_a_jour.get("name"),
+        "corbeille": mis_a_jour.get("trashed", False),
+    }
+
+
 app = mcp.http_app(
     path=os.environ.get("MCP_PATH", "/mcp"),
     middleware=[Middleware(ApiKeyMiddleware)],
@@ -134,7 +261,9 @@ except Exception:  # noqa: BLE001
 
 print(
     "[bootstrap] point d'entrée actif, fastmcp " + str(_version) +
-    ", outils supplémentaires : update_web_app_deployment, identite_du_serveur",
+    ", outils supplémentaires : update_web_app_deployment, "
+    "identite_du_serveur, move_file_to_folder, copy_file_to_folder, "
+    "trash_drive_file",
     flush=True,
 )
 
