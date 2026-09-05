@@ -10,8 +10,6 @@ importe main, qui enregistre ses outils au passage, ajoute les siens sur
 le même serveur, puis reconstruit l'application ASGI avec le même chemin
 et le même contrôle de clé.
 
-main.py n'est pas modifié d'une ligne.
-
 Attention : la commande de démarrage vit dans les réglages Railway, pas
 dans le Procfile, et elle l'emporte sur lui. Elle doit valoir
 « python bootstrap.py », sans quoi ce fichier n'est jamais exécuté et
@@ -115,6 +113,144 @@ def identite_du_serveur():
         rapport["drive"] = "indisponible : " + str(exc)
 
     return rapport
+
+
+def _contenu_verifie(script_id: str, fichiers_attendus: int = 0):
+    """Lit le contenu d'un projet Apps Script en vérifiant que c'est le bon.
+
+    POURQUOI CE GARDE-FOU EXISTE. Le 05.09.2026, une écriture a échoué en
+    SSL. La relance a lu, sous l'identifiant du projet « Almaval - Base
+    patients universelle et radars », le contenu d'un AUTRE projet, et
+    l'écriture qui a suivi a effacé les 63 fichiers du premier. L'API
+    Apps Script n'a pas d'écriture partielle : toute modification passe
+    par un cycle lire, modifier, tout réécrire. Une lecture fausse
+    détruit donc le projet entier.
+
+    Trois vérifications avant toute réécriture :
+      - l'identifiant du projet relu est bien celui demandé ;
+      - le projet n'est pas revenu vide, ce qui effacerait tout ;
+      - si l'appelant annonce un nombre de fichiers attendu, il correspond.
+
+    En cas de doute on lève une exception et on n'écrit rien. Ne rien
+    écrire est toujours réparable, écrire par-dessus ne l'est pas.
+    """
+    contenu = _script().projects().getContent(scriptId=script_id).execute()
+    lu = contenu.get("scriptId")
+    if lu and lu != script_id:
+        raise RuntimeError(
+            "Lecture incohérente : projet demandé {}, contenu renvoyé par le "
+            "serveur {}. Aucune écriture n'a été faite.".format(script_id, lu)
+        )
+    fichiers = contenu.get("files", [])
+    if not fichiers:
+        raise RuntimeError(
+            "Le projet {} est revenu sans aucun fichier. Aucune écriture n'a "
+            "été faite : réécrire par-dessus une lecture vide effacerait "
+            "tout.".format(script_id)
+        )
+    if fichiers_attendus and len(fichiers) != fichiers_attendus:
+        raise RuntimeError(
+            "Le projet {} contient {} fichiers, or {} étaient attendus. "
+            "Aucune écriture n'a été faite.".format(
+                script_id, len(fichiers), fichiers_attendus
+            )
+        )
+    return fichiers
+
+
+@mcp.tool()
+@tolerant
+def delete_script_files(
+    script_id: str,
+    filenames: str,
+    fichiers_attendus: int = 0,
+):
+    """Supprime définitivement un ou plusieurs fichiers d'un projet Apps Script.
+
+    L'API Apps Script n'a pas d'opération de suppression : elle ne sait
+    que remplacer le contenu entier d'un projet. Supprimer un fichier
+    consiste donc à relire tout le projet, à retirer les fichiers visés
+    de la liste, puis à réécrire le reste. C'est exactement le cycle qui
+    a détruit un projet le 05.09.2026, quand la lecture a renvoyé un
+    autre projet que celui demandé. Les protections ci-dessous ne sont
+    donc pas décoratives.
+
+    script_id : le projet à modifier.
+    filenames : les noms des fichiers à supprimer, sans extension, tels
+                qu'ils apparaissent dans l'éditeur. Plusieurs noms se
+                séparent par une virgule :
+                « 00 Configuration, 01 Lecture, 02 Contrat ».
+                Un nom contenant lui-même une virgule n'est pas prévu,
+                Apps Script n'en accepte pas.
+    fichiers_attendus : nombre de fichiers que le projet doit contenir
+                AVANT la suppression. 0 pour ne pas contrôler. Le
+                renseigner est la meilleure protection disponible : si le
+                serveur relit un autre projet, le compte ne correspond
+                pas et rien n'est supprimé.
+
+    Refus explicites, jamais silencieux :
+      - le manifeste « appsscript » ne se supprime pas, un projet sans
+        manifeste est invalide ;
+      - une suppression qui viderait le projet est refusée ;
+      - un nom absent est signalé et n'empêche pas les autres.
+
+    Après l'écriture, le projet est relu et la réponse dit ce qui reste :
+    la vérification ne repose pas sur la confiance.
+    """
+    demandes = [n.strip() for n in str(filenames or "").split(",") if n.strip()]
+    if not demandes:
+        raise RuntimeError("aucun nom de fichier à supprimer n'a été donné")
+
+    fichiers = _contenu_verifie(script_id, fichiers_attendus)
+    presents = [f.get("name") for f in fichiers]
+
+    if "appsscript" in demandes:
+        raise RuntimeError(
+            "le manifeste « appsscript » ne peut pas être supprimé : un projet "
+            "Apps Script sans manifeste est invalide"
+        )
+
+    introuvables = [n for n in demandes if n not in presents]
+    a_supprimer = [n for n in demandes if n in presents]
+    if not a_supprimer:
+        return {
+            "script_id": script_id,
+            "fichiers_supprimes": [],
+            "introuvables": introuvables,
+            "fichiers_presents": presents,
+            "message": (
+                "aucun des noms demandés n'existe dans ce projet, "
+                "rien n'a été modifié"
+            ),
+        }
+
+    restants = [f for f in fichiers if f.get("name") not in a_supprimer]
+    if not restants:
+        raise RuntimeError(
+            "refus : cette suppression viderait entièrement le projet "
+            + str(script_id)
+        )
+    if not any(f.get("name") == "appsscript" for f in restants):
+        raise RuntimeError(
+            "refus : le projet " + str(script_id)
+            + " se retrouverait sans manifeste"
+        )
+
+    _script().projects().updateContent(
+        scriptId=script_id, body={"files": restants}
+    ).execute()
+
+    relu = _script().projects().getContent(scriptId=script_id).execute()
+    noms_apres = [f.get("name") for f in relu.get("files", [])]
+    return {
+        "script_id": script_id,
+        "fichiers_supprimes": a_supprimer,
+        "introuvables": introuvables,
+        "fichiers_avant": len(fichiers),
+        "fichiers_apres": len(noms_apres),
+        "encore_presents_a_tort": [n for n in a_supprimer if n in noms_apres],
+        "fichiers": noms_apres,
+    }
 
 
 @mcp.tool()
@@ -252,6 +388,12 @@ app = mcp.http_app(
 
 # Trace de démarrage. main.py et bootstrap.py produisent les mêmes
 # journaux uvicorn : sans cette ligne, rien ne dit lequel tourne.
+#
+# Le nombre d'outils réellement enregistrés y figure depuis le
+# 05.09.2026 : ce jour-là, un outil ajouté dans main.py n'est jamais
+# apparu côté client alors que le déploiement était en succès, et rien
+# ne permettait de savoir si le conteneur avait pris le nouveau code.
+# Un compteur au démarrage tranche la question en une ligne de journal.
 try:
     import fastmcp as _fastmcp
 
@@ -259,11 +401,18 @@ try:
 except Exception:  # noqa: BLE001
     _version = "inconnue"
 
+try:
+    _registre = getattr(getattr(mcp, "_tool_manager", None), "_tools", None)
+    _nb_outils = len(_registre) if _registre is not None else -1
+except Exception:  # noqa: BLE001
+    _nb_outils = -1
+
 print(
     "[bootstrap] point d'entrée actif, fastmcp " + str(_version) +
+    ", outils enregistrés : " + str(_nb_outils) +
     ", outils supplémentaires : update_web_app_deployment, "
-    "identite_du_serveur, move_file_to_folder, copy_file_to_folder, "
-    "trash_drive_file",
+    "identite_du_serveur, delete_script_files, move_file_to_folder, "
+    "copy_file_to_folder, trash_drive_file",
     flush=True,
 )
 
