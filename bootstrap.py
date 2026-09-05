@@ -422,6 +422,19 @@ def _registre_des_outils():
 _pistes = sorted(a for a in dir(mcp) if "tool" in a.lower())
 _noms_outils = _registre_des_outils()
 
+if not _noms_outils:
+    try:
+        import asyncio
+
+        _liste = asyncio.run(mcp.list_tools())
+        _noms_outils = sorted(getattr(o, "name", str(o)) for o in _liste)
+    except Exception as exc:  # noqa: BLE001
+        print(
+            "[bootstrap] list_tools indisponible : "
+            + type(exc).__name__ + " " + str(exc)[:160],
+            flush=True,
+        )
+
 print(
     "[bootstrap] point d'entrée actif, fastmcp " + str(_version) +
     ", outils exposés : " + (str(len(_noms_outils)) if _noms_outils else "inconnu"),
