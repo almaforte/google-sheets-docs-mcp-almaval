@@ -158,7 +158,7 @@ def _contenu_verifie(script_id: str, fichiers_attendus: int = 0):
     return fichiers
 
 
-@mcp.tool()
+@mcp.tool
 @tolerant
 def delete_script_files(
     script_id: str,
@@ -401,24 +401,35 @@ try:
 except Exception:  # noqa: BLE001
     _version = "inconnue"
 
-_noms_outils = []
-try:
-    import asyncio
+# Retrouver le registre des outils sans dépendre d'une API précise de
+# FastMCP, dont le nom change d'une version à l'autre. On cherche, sur le
+# serveur puis sur son gestionnaire d'outils, le premier dictionnaire dont
+# les clés ressemblent à des noms d'outils.
+def _registre_des_outils():
+    porteurs = [mcp]
+    for nom in ("_tool_manager", "tool_manager", "_tools_manager"):
+        obj = getattr(mcp, nom, None)
+        if obj is not None:
+            porteurs.append(obj)
+    for porteur in porteurs:
+        for nom in ("_tools", "tools", "_registry", "registry"):
+            obj = getattr(porteur, nom, None)
+            if isinstance(obj, dict) and obj:
+                return sorted(str(k) for k in obj.keys())
+    return None
 
-    _exposes = asyncio.run(mcp.get_tools())
-    if isinstance(_exposes, dict):
-        _noms_outils = sorted(_exposes.keys())
-    else:
-        _noms_outils = sorted(getattr(o, "name", str(o)) for o in _exposes)
-except Exception as exc:  # noqa: BLE001
-    _noms_outils = ["(liste indisponible : " + type(exc).__name__ + " " + str(exc)[:120] + ")"]
+
+_pistes = sorted(a for a in dir(mcp) if "tool" in a.lower())
+_noms_outils = _registre_des_outils()
 
 print(
     "[bootstrap] point d'entrée actif, fastmcp " + str(_version) +
-    ", outils exposés : " + str(len(_noms_outils)),
+    ", outils exposés : " + (str(len(_noms_outils)) if _noms_outils else "inconnu"),
     flush=True,
 )
-print("[bootstrap] noms des outils : " + ", ".join(_noms_outils), flush=True)
+print("[bootstrap] attributs candidats : " + ", ".join(_pistes), flush=True)
+if _noms_outils:
+    print("[bootstrap] noms des outils : " + ", ".join(_noms_outils), flush=True)
 
 
 if __name__ == "__main__":
