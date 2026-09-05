@@ -2837,92 +2837,11 @@ def write_script_file(
     }
 
 
-@mcp.tool
-@tolerant
-def delete_script_files(
-    script_id: str,
-    filenames: list,
-    fichiers_attendus: int = 0,
-) -> Any:
-    """Supprime définitivement un ou plusieurs fichiers d'un projet Apps Script.
-
-    L'API Apps Script n'a pas d'opération de suppression : elle ne sait que
-    remplacer le contenu entier d'un projet. Supprimer un fichier consiste
-    donc à relire tout le projet, à retirer les fichiers visés de la liste,
-    et à réécrire le reste. C'est exactement le cycle qui a détruit un projet
-    le 05.09.2026 quand la lecture a renvoyé un autre projet, d'où les
-    protections ci-dessous, qui ne sont pas décoratives.
-
-    script_id : le projet à modifier.
-    filenames : la liste des noms de fichiers à supprimer, sans extension,
-                tels qu'ils apparaissent dans l'éditeur (« 00 Configuration »,
-                « ZCourriel »...). Un seul fichier se passe dans une liste
-                d'un élément.
-    fichiers_attendus : nombre de fichiers que le projet doit contenir avant
-                la suppression. 0 pour ne pas contrôler. Le renseigner est la
-                meilleure protection disponible : si le serveur relit un
-                autre projet, le compte ne correspond pas et rien n'est
-                supprimé.
-
-    Refus explicites, jamais silencieux :
-      - le manifeste « appsscript » ne se supprime pas, un projet sans
-        manifeste est invalide ;
-      - une suppression qui viderait le projet est refusée ;
-      - un nom absent du projet est signalé et n'empêche pas les autres
-        suppressions demandées.
-
-    Après l'écriture, le projet est relu et la réponse dit ce qui reste,
-    pour que la vérification ne repose pas sur la confiance.
-    """
-    demandes = [str(n).strip() for n in (filenames or []) if str(n).strip()]
-    if not demandes:
-        raise RuntimeError("aucun nom de fichier à supprimer n'a été donné")
-
-    fichiers = _lire_projet_verifie(script_id, fichiers_attendus)
-    presents = [f.get("name") for f in fichiers]
-
-    if "appsscript" in demandes:
-        raise RuntimeError(
-            "le manifeste « appsscript » ne peut pas être supprimé : un projet "
-            "Apps Script sans manifeste est invalide"
-        )
-
-    introuvables = [n for n in demandes if n not in presents]
-    a_supprimer = [n for n in demandes if n in presents]
-    if not a_supprimer:
-        return {
-            "script_id": script_id,
-            "fichiers_supprimes": [],
-            "introuvables": introuvables,
-            "fichiers_presents": presents,
-            "message": "aucun des noms demandés n'existe dans ce projet, rien n'a été modifié",
-        }
-
-    restants = [f for f in fichiers if f.get("name") not in a_supprimer]
-    if not restants:
-        raise RuntimeError(
-            "refus : cette suppression viderait entièrement le projet {}".format(script_id)
-        )
-    if not any(f.get("name") == "appsscript" for f in restants):
-        raise RuntimeError(
-            "refus : le projet {} se retrouverait sans manifeste".format(script_id)
-        )
-
-    _script().projects().updateContent(
-        scriptId=script_id, body={"files": restants}
-    ).execute()
-
-    relu = _script().projects().getContent(scriptId=script_id).execute()
-    noms_apres = [f.get("name") for f in relu.get("files", [])]
-    return {
-        "script_id": script_id,
-        "fichiers_supprimes": a_supprimer,
-        "introuvables": introuvables,
-        "fichiers_avant": len(fichiers),
-        "fichiers_apres": len(noms_apres),
-        "encore_presents_a_tort": [n for n in a_supprimer if n in noms_apres],
-        "fichiers": noms_apres,
-    }
+# L'outil delete_script_files vit dans bootstrap.py, avec les autres outils
+# ajoutés après coup, et non ici : le 05.09.2026, ajouté dans ce fichier, il
+# n'est jamais apparu côté client alors que le déploiement était en succès.
+# Le garde-fou _lire_projet_verifie, lui, reste ici : c'est write_script_file
+# qui en a besoin.
 
 
 @mcp.tool
