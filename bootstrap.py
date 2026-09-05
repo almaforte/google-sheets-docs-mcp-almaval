@@ -18,11 +18,13 @@ rien ne le signale.
 
 import os
 
+import requests
 import uvicorn
+from google.auth.transport.requests import Request as GoogleAuthRequest
 from starlette.middleware import Middleware
 
 import main
-from main import ApiKeyMiddleware, mcp, tolerant, _script
+from main import ApiKeyMiddleware, mcp, tolerant, _script, _user_credentials
 
 
 @mcp.tool()
@@ -251,6 +253,108 @@ def delete_script_files(
         "encore_presents_a_tort": [n for n in a_supprimer if n in noms_apres],
         "fichiers": noms_apres,
     }
+
+
+def _url_application_web(script_id: str) -> str:
+    """L'adresse d'exécution de l'application web d'un projet.
+
+    Deux sortes de déploiements cohabitent. Celui dont le numéro de version
+    est absent est le déploiement de TÊTE : il sert toujours le code
+    enregistré à l'instant, donc c'est lui qu'on veut pour lancer une
+    action. Les autres sont figés sur une version publiée. À défaut de
+    déploiement de tête, on prend le numéro de version le plus élevé.
+    """
+    liste = _script().projects().deployments().list(scriptId=script_id).execute()
+    tete, versionne = None, None
+    for d in liste.get("deployments", []):
+        url = ""
+        for entree in d.get("entryPoints", []):
+            if entree.get("entryPointType") == "WEB_APP":
+                url = entree.get("webApp", {}).get("url", "")
+        if not url:
+            continue
+        version = d.get("deploymentConfig", {}).get("versionNumber")
+        if version is None:
+            tete = url
+        elif versionne is None or version > versionne[0]:
+            versionne = (version, url)
+    if tete:
+        return tete
+    if versionne:
+        return versionne[1]
+    return ""
+
+
+@mcp.tool()
+@tolerant
+def run_script_action(script_id: str, payload: dict = None, timeout: int = 120):
+    """Lance une action d'un projet Apps Script à partir de son IDENTIFIANT.
+
+    Autorisation donnée par Alberto le 05.09.2026 : « ajoute le fait de
+    lancer des actions des scripts tout seul ».
+
+    C'est run_web_app, sans avoir à connaître l'adresse d'exécution :
+    l'outil retrouve lui-même le déploiement de tête du projet et lui
+    envoie la charge utile. L'adresse d'un déploiement est longue,
+    change quand on republie ailleurs, et la retenir de mémoire est
+    précisément la façon de finir par appeler le mauvais projet.
+
+    script_id : le projet dont on veut lancer une action.
+    payload   : le dictionnaire transmis au script, par exemple
+                {"action": "cycle"}. Ce que le projet accepte lui
+                appartient : il n'y a pas de liste d'actions commune.
+    timeout   : secondes d'attente. Le connecteur coupe de toute façon
+                vers la soixantième, donc un travail long se lance par
+                l'action de mise en tâche de fond du projet lui-même.
+
+    L'appel est authentifié par le compte du serveur, ce qui permet à
+    l'application de rester publiée en accès réservé. L'exécution se fait
+    sous l'autorisation du PROJET, pas sous les permissions de ce
+    serveur : c'est pourquoi cette porte-là fonctionne là où l'API
+    scripts.run échoue, sa règle étant que le jeton appelant doit déjà
+    porter toutes les permissions du script appelé.
+    """
+    url = _url_application_web(script_id)
+    if not url:
+        return {
+            "erreur": "aucun déploiement en application web sur ce projet",
+            "detail": (
+                "Publier d'abord le projet avec deploy_web_app, ou vérifier "
+                "l'identifiant du projet."
+            ),
+        }
+
+    corps = dict(payload or {})
+    secret = os.environ.get("SCRIPT_SHARED_SECRET", "")
+    if secret:
+        corps["secret"] = secret
+
+    creds = _user_credentials()
+    creds.refresh(GoogleAuthRequest())
+    entetes = {"Authorization": "Bearer " + creds.token}
+
+    reponse = requests.post(
+        url, json=corps, headers=entetes, timeout=timeout, allow_redirects=False
+    )
+    if reponse.status_code in (301, 302, 303, 307, 308):
+        cible = reponse.headers.get("location", "")
+        if cible:
+            reponse = requests.get(cible, timeout=timeout)
+
+    try:
+        return {"url": url, "statut": reponse.status_code, "reponse": reponse.json()}
+    except ValueError:
+        if "Authorization needed" in reponse.text:
+            return {
+                "url": url,
+                "statut": reponse.status_code,
+                "erreur": "Projet non autorisé.",
+                "detail": (
+                    "Ouvrir le projet dans l'éditeur Apps Script, exécuter une "
+                    "fonction et accepter les permissions, puis relancer."
+                ),
+            }
+        return {"url": url, "statut": reponse.status_code, "reponse": reponse.text[:2000]}
 
 
 @mcp.tool()
