@@ -19,12 +19,94 @@ rien ne le signale.
 """
 
 import os
+import threading
 
 import uvicorn
+from googleapiclient.discovery import build
 from starlette.middleware import Middleware
 
 import main
-from main import ApiKeyMiddleware, mcp, tolerant, _script
+from main import ApiKeyMiddleware, mcp, tolerant
+
+
+# ================================================================
+#  CLIENTS GOOGLE PAR THREAD
+#  Correctif du 05.09.2026, après deux arrêts brutaux du serveur.
+# ================================================================
+#
+# Symptôme : « free(): corrupted unsorted chunks » puis « Fatal Python
+# error: Aborted », dans la fermeture d'une socket SSL sous httplib2,
+# appelée par googleapiclient. Le processus entier meurt d'un coup, sans
+# exception Python, donc le décorateur tolerant ne peut rien intercepter,
+# et Railway finit par cesser de le relancer.
+#
+# Cause : main.py met en cache un client par API dans le dictionnaire
+# global _services. Chaque client construit par build() embarque un objet
+# httplib2.Http unique, et httplib2 n'est pas conçu pour être partagé
+# entre threads. Or FastMCP exécute chaque appel d'outil dans un thread
+# de travail distinct : dès que deux conversations sollicitent le
+# connecteur en même temps, deux threads manipulent et referment la même
+# connexion, d'où la double libération mémoire et l'abandon du processus.
+#
+# Correctif : un client par thread, donc un objet Http par thread, plus
+# aucun partage. Le cache reste, mais il vit dans un threading.local()
+# au lieu d'un dictionnaire global. Les identifiants sont eux aussi
+# reconstruits par thread, un jeton se rafraîchissant sans coordination
+# entre threads.
+#
+# À noter, pour éviter un aller-retour inutile plus tard : le transport
+# requests (AuthorizedSession) ne peut pas remplacer httplib2 ici.
+# google-api-python-client n'accepte, en paramètre http, qu'un objet
+# exposant l'interface httplib2, et une session requests ne la respecte
+# pas. La façon soutenue par Google d'écarter le problème est exactement
+# celle appliquée ci-dessous, un Http par thread.
+#
+# build() n'appelle pas le réseau : depuis la version 2, la découverte
+# des API est servie par les documents embarqués dans le paquet, donc
+# créer un client dans un nouveau thread ne coûte quasiment rien.
+
+_par_thread = threading.local()
+
+
+def _client(cle: str, api: str, version: str, fabrique_identifiants):
+    clients = getattr(_par_thread, "clients", None)
+    if clients is None:
+        clients = {}
+        _par_thread.clients = clients
+    if cle not in clients:
+        clients[cle] = build(
+            api,
+            version,
+            credentials=fabrique_identifiants(),
+            cache_discovery=False,
+        )
+    return clients[cle]
+
+
+def _sheets():
+    return _client("sheets", "sheets", "v4", main._credentials)
+
+
+def _docs():
+    return _client("docs", "docs", "v1", main._credentials)
+
+
+def _drive():
+    return _client("drive", "drive", "v3", main._credentials)
+
+
+def _script():
+    return _client("script", "script", "v1", main._user_credentials)
+
+
+# Les outils de main.py appellent _sheets(), _docs(), _drive() et
+# _script() par leur nom global, résolu à chaque appel : remplacer ces
+# quatre noms dans le module main suffit à ce que tous ses outils
+# passent par les clients par thread, sans toucher une ligne de main.py.
+main._sheets = _sheets
+main._docs = _docs
+main._drive = _drive
+main._script = _script
 
 
 @mcp.tool()
@@ -109,7 +191,7 @@ def identite_du_serveur():
         rapport["apps_script"] = "indisponible : " + str(exc)
 
     try:
-        about = main._drive().about().get(fields="user(emailAddress)").execute()
+        about = _drive().about().get(fields="user(emailAddress)").execute()
         rapport["drive"] = about.get("user", {}).get("emailAddress", "")
     except Exception as exc:  # noqa: BLE001
         rapport["drive"] = "indisponible : " + str(exc)
@@ -144,14 +226,14 @@ def move_file_to_folder(file_id: str, target_folder_id: str):
     ne fait que confirmer son état).
     """
     actuel = (
-        main._drive()
+        _drive()
         .files()
         .get(fileId=file_id, fields="parents,name", supportsAllDrives=True)
         .execute()
     )
     anciens_parents = actuel.get("parents", [])
     deplace = (
-        main._drive()
+        _drive()
         .files()
         .update(
             fileId=file_id,
@@ -193,7 +275,7 @@ def copy_file_to_folder(file_id: str, target_folder_id: str, new_name: str = "")
     if new_name:
         corps["name"] = new_name
     copie = (
-        main._drive()
+        _drive()
         .files()
         .copy(
             fileId=file_id,
@@ -227,7 +309,7 @@ def trash_drive_file(file_id: str):
     mise à la corbeille plutôt que déplacée à côté de la bonne).
     """
     mis_a_jour = (
-        main._drive()
+        _drive()
         .files()
         .update(
             fileId=file_id,
@@ -261,6 +343,7 @@ except Exception:  # noqa: BLE001
 
 print(
     "[bootstrap] point d'entrée actif, fastmcp " + str(_version) +
+    ", clients Google par thread actifs"
     ", outils supplémentaires : update_web_app_deployment, "
     "identite_du_serveur, move_file_to_folder, copy_file_to_folder, "
     "trash_drive_file",
