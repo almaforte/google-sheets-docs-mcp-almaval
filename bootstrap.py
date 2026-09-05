@@ -401,20 +401,24 @@ try:
 except Exception:  # noqa: BLE001
     _version = "inconnue"
 
+_noms_outils = []
 try:
-    _registre = getattr(getattr(mcp, "_tool_manager", None), "_tools", None)
-    _nb_outils = len(_registre) if _registre is not None else -1
-except Exception:  # noqa: BLE001
-    _nb_outils = -1
+    import asyncio
+
+    _exposes = asyncio.run(mcp.get_tools())
+    if isinstance(_exposes, dict):
+        _noms_outils = sorted(_exposes.keys())
+    else:
+        _noms_outils = sorted(getattr(o, "name", str(o)) for o in _exposes)
+except Exception as exc:  # noqa: BLE001
+    _noms_outils = ["(liste indisponible : " + type(exc).__name__ + " " + str(exc)[:120] + ")"]
 
 print(
     "[bootstrap] point d'entrée actif, fastmcp " + str(_version) +
-    ", outils enregistrés : " + str(_nb_outils) +
-    ", outils supplémentaires : update_web_app_deployment, "
-    "identite_du_serveur, delete_script_files, move_file_to_folder, "
-    "copy_file_to_folder, trash_drive_file",
+    ", outils exposés : " + str(len(_noms_outils)),
     flush=True,
 )
+print("[bootstrap] noms des outils : " + ", ".join(_noms_outils), flush=True)
 
 
 if __name__ == "__main__":
