@@ -2701,6 +2701,48 @@ def create_script_project(title: str, parent_id: str = "") -> Any:
     }
 
 
+def _lire_projet_verifie(script_id: str, fichiers_attendus: int = 0) -> list:
+    """Lit le contenu d'un projet Apps Script en vérifiant que c'est le bon.
+
+    POURQUOI CE GARDE-FOU EXISTE. Le 05.09.2026, une écriture a échoué en
+    SSL. La relance a lu, sous l'identifiant du projet « Base patients
+    universelle », le contenu d'un AUTRE projet, et l'écriture qui a suivi a
+    effacé les 63 fichiers du premier. L'API Apps Script n'a pas d'écriture
+    partielle : toute modification d'un fichier passe par un cycle lire,
+    modifier, tout réécrire. Une lecture fausse détruit donc le projet.
+
+    Trois vérifications, avant toute réécriture :
+      - l'identifiant du projet relu est bien celui demandé ;
+      - le projet n'est pas revenu vide, ce qui effacerait tout ;
+      - si l'appelant annonce un nombre de fichiers attendu, il correspond.
+
+    En cas de doute, on lève une exception et on n'écrit rien. Ne rien
+    écrire est toujours réparable, écrire par-dessus ne l'est pas.
+    """
+    contenu = _script().projects().getContent(scriptId=script_id).execute()
+    lu = contenu.get("scriptId")
+    if lu and lu != script_id:
+        raise RuntimeError(
+            "Lecture incohérente : projet demandé {}, contenu renvoyé par le "
+            "serveur {}. Aucune écriture n'a été faite.".format(script_id, lu)
+        )
+    fichiers = contenu.get("files", [])
+    if not fichiers:
+        raise RuntimeError(
+            "Le projet {} est revenu sans aucun fichier. Aucune écriture n'a "
+            "été faite : réécrire par-dessus une lecture vide effacerait "
+            "tout.".format(script_id)
+        )
+    if fichiers_attendus and len(fichiers) != fichiers_attendus:
+        raise RuntimeError(
+            "Le projet {} contient {} fichiers, or {} étaient attendus. "
+            "Aucune écriture n'a été faite.".format(
+                script_id, len(fichiers), fichiers_attendus
+            )
+        )
+    return fichiers
+
+
 @mcp.tool
 @tolerant
 def get_script_content(script_id: str) -> Any:
@@ -2731,6 +2773,7 @@ def write_script_file(
     file_type: str = "SERVER_JS",
     webapp: bool = False,
     access: str = DEFAULT_WEBAPP_ACCESS,
+    fichiers_attendus: int = 0,
 ) -> Any:
     """Écrit ou remplace un fichier dans un projet Apps Script.
 
@@ -2744,9 +2787,16 @@ def write_script_file(
     access    : 'MYSELF' par défaut, l'appel de run_web_app étant authentifié.
                 'ANYONE_ANONYMOUS' n'est à utiliser que pour un webhook
                 réellement public, appelé par un tiers sans jeton Google.
+    fichiers_attendus : nombre de fichiers que le projet doit contenir avant
+                l'écriture. 0 pour ne pas contrôler. À renseigner pendant une
+                série d'écritures : si le serveur relit un autre projet que
+                celui demandé, l'écriture est refusée au lieu d'écraser.
+
+    L'écriture passe toujours par _lire_projet_verifie : un projet relu vide,
+    ou dont l'identifiant ne correspond pas, fait échouer l'appel sans rien
+    modifier. Voir l'incident du 05.09.2026 documenté dans cette fonction.
     """
-    current = _script().projects().getContent(scriptId=script_id).execute()
-    files = current.get("files", [])
+    files = _lire_projet_verifie(script_id, fichiers_attendus)
 
     # Cas particulier : on écrit directement le manifeste, il passe tel quel.
     if filename == "appsscript":
@@ -2784,6 +2834,94 @@ def write_script_file(
         "fichier_ecrit": filename,
         "fichiers_totaux": len(kept),
         "acces_webapp": access if webapp else None,
+    }
+
+
+@mcp.tool
+@tolerant
+def delete_script_files(
+    script_id: str,
+    filenames: list,
+    fichiers_attendus: int = 0,
+) -> Any:
+    """Supprime définitivement un ou plusieurs fichiers d'un projet Apps Script.
+
+    L'API Apps Script n'a pas d'opération de suppression : elle ne sait que
+    remplacer le contenu entier d'un projet. Supprimer un fichier consiste
+    donc à relire tout le projet, à retirer les fichiers visés de la liste,
+    et à réécrire le reste. C'est exactement le cycle qui a détruit un projet
+    le 05.09.2026 quand la lecture a renvoyé un autre projet, d'où les
+    protections ci-dessous, qui ne sont pas décoratives.
+
+    script_id : le projet à modifier.
+    filenames : la liste des noms de fichiers à supprimer, sans extension,
+                tels qu'ils apparaissent dans l'éditeur (« 00 Configuration »,
+                « ZCourriel »...). Un seul fichier se passe dans une liste
+                d'un élément.
+    fichiers_attendus : nombre de fichiers que le projet doit contenir avant
+                la suppression. 0 pour ne pas contrôler. Le renseigner est la
+                meilleure protection disponible : si le serveur relit un
+                autre projet, le compte ne correspond pas et rien n'est
+                supprimé.
+
+    Refus explicites, jamais silencieux :
+      - le manifeste « appsscript » ne se supprime pas, un projet sans
+        manifeste est invalide ;
+      - une suppression qui viderait le projet est refusée ;
+      - un nom absent du projet est signalé et n'empêche pas les autres
+        suppressions demandées.
+
+    Après l'écriture, le projet est relu et la réponse dit ce qui reste,
+    pour que la vérification ne repose pas sur la confiance.
+    """
+    demandes = [str(n).strip() for n in (filenames or []) if str(n).strip()]
+    if not demandes:
+        raise RuntimeError("aucun nom de fichier à supprimer n'a été donné")
+
+    fichiers = _lire_projet_verifie(script_id, fichiers_attendus)
+    presents = [f.get("name") for f in fichiers]
+
+    if "appsscript" in demandes:
+        raise RuntimeError(
+            "le manifeste « appsscript » ne peut pas être supprimé : un projet "
+            "Apps Script sans manifeste est invalide"
+        )
+
+    introuvables = [n for n in demandes if n not in presents]
+    a_supprimer = [n for n in demandes if n in presents]
+    if not a_supprimer:
+        return {
+            "script_id": script_id,
+            "fichiers_supprimes": [],
+            "introuvables": introuvables,
+            "fichiers_presents": presents,
+            "message": "aucun des noms demandés n'existe dans ce projet, rien n'a été modifié",
+        }
+
+    restants = [f for f in fichiers if f.get("name") not in a_supprimer]
+    if not restants:
+        raise RuntimeError(
+            "refus : cette suppression viderait entièrement le projet {}".format(script_id)
+        )
+    if not any(f.get("name") == "appsscript" for f in restants):
+        raise RuntimeError(
+            "refus : le projet {} se retrouverait sans manifeste".format(script_id)
+        )
+
+    _script().projects().updateContent(
+        scriptId=script_id, body={"files": restants}
+    ).execute()
+
+    relu = _script().projects().getContent(scriptId=script_id).execute()
+    noms_apres = [f.get("name") for f in relu.get("files", [])]
+    return {
+        "script_id": script_id,
+        "fichiers_supprimes": a_supprimer,
+        "introuvables": introuvables,
+        "fichiers_avant": len(fichiers),
+        "fichiers_apres": len(noms_apres),
+        "encore_presents_a_tort": [n for n in a_supprimer if n in noms_apres],
+        "fichiers": noms_apres,
     }
 
 
